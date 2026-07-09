@@ -1,49 +1,68 @@
-name: CANTARELLA Health Check
+name: Clone, Build & Notify via Upstash Redis
 
 on:
   repository_dispatch:
     types: [health-check]
-  workflow_dispatch:  # allows manual trigger too
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'GitHub repository URL to clone'
+        required: true
+        type: string
+      repo_ref:
+        description: 'Branch/tag/commit to checkout (optional)'
+        required: false
+        type: string
+        default: 'main'
 
 jobs:
-  build-and-test:
+  build-and-run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Build Docker image
-        id: build
-        run: docker build -t cantarella-bypass .
-
-      - name: Run container
-        id: run
+      - name: Resolve inputs (dispatch vs workflow_dispatch)
+        id: vars
         run: |
-          docker run -d -p 3000:3000 --name cantarella-bypass cantarella-bypass
-          sleep 10  # give it time to start; adjust as needed
-
-      - name: Check container is healthy
-        id: healthcheck
-        run: |
-          if [ "$(docker inspect -f '{{.State.Running}}' cantarella-bypass)" != "true" ]; then
-            echo "Container not running"
-            exit 1
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "repo_url=${{ github.event.client_payload.repo_url }}" >> "$GITHUB_OUTPUT"
+            echo "repo_ref=${{ github.event.client_payload.repo_ref || 'main' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo_url=${{ inputs.repo_url }}" >> "$GITHUB_OUTPUT"
+            echo "repo_ref=${{ inputs.repo_ref }}" >> "$GITHUB_OUTPUT"
           fi
-          # optional: curl your own /health endpoint if the app exposes one
-          # curl -f http://localhost:3000/health
 
-      - name: Report success to Upstash Redis
+      - name: Clone target repository
+        run: |
+          git clone --branch "${{ steps.vars.outputs.repo_ref }}" "${{ steps.vars.outputs.repo_url }}" cloned-repo || \
+          git clone "${{ steps.vars.outputs.repo_url }}" cloned-repo
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: cloned-repo
+        run: bun install
+
+      - name: Start the server
+        working-directory: cloned-repo
+        run: bun start
+
+      - name: Notify success to Upstash Redis
         if: success()
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          curl -X POST "${{ secrets.UPSTASH_REDIS_REST_URL }}/set/cantarella_status/success" \
-            -H "Authorization: Bearer ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}"
+          curl -X POST "$UPSTASH_REDIS_REST_URL/set/job_status/success" \
+            -H "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN"
 
-      - name: Report failure to Upstash Redis
+      - name: Notify failure to Upstash Redis
         if: failure()
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          curl -X POST "${{ secrets.UPSTASH_REDIS_REST_URL }}/set/cantarella_status/failure" \
-            -H "Authorization: Bearer ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}"
-
-      - name: Cleanup
-        if: always()
-        run: docker rm -f cantarella-bypass || true
+          curl -X POST "$UPSTASH_REDIS_REST_URL/set/job_status/failed" \
+            -H "Authorization: Bearer $UPSTASH_REDIS_REST_TOKEN"
