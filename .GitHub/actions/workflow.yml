@@ -1,0 +1,49 @@
+name: CANTARELLA Health Check
+
+on:
+  repository_dispatch:
+    types: [health-check]
+  workflow_dispatch:  # allows manual trigger too
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        id: build
+        run: docker build -t cantarella-bypass .
+
+      - name: Run container
+        id: run
+        run: |
+          docker run -d -p 3000:3000 --name cantarella-bypass cantarella-bypass
+          sleep 10  # give it time to start; adjust as needed
+
+      - name: Check container is healthy
+        id: healthcheck
+        run: |
+          if [ "$(docker inspect -f '{{.State.Running}}' cantarella-bypass)" != "true" ]; then
+            echo "Container not running"
+            exit 1
+          fi
+          # optional: curl your own /health endpoint if the app exposes one
+          # curl -f http://localhost:3000/health
+
+      - name: Report success to Upstash Redis
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.UPSTASH_REDIS_REST_URL }}/set/cantarella_status/success" \
+            -H "Authorization: Bearer ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}"
+
+      - name: Report failure to Upstash Redis
+        if: failure()
+        run: |
+          curl -X POST "${{ secrets.UPSTASH_REDIS_REST_URL }}/set/cantarella_status/failure" \
+            -H "Authorization: Bearer ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f cantarella-bypass || true
