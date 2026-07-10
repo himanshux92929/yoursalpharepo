@@ -16,23 +16,29 @@ jobs:
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      # 2. Dynamically drop your custom Bun Docker environment
+      # 2. Dynamically drop the correct environment with browser support
       - name: Create Dockerfile dynamically
         run: |
           cat << 'EOF' > Dockerfile
-          FROM oven/bun:1-slim
+          FROM oven/bun:1
+
+          # Install browser system dependencies
+          RUN apt-get update && apt-get install -y \
+            libgbm1 \
+            libnss3 \
+            libatk-bridge2.0-0 \
+            libgtk-3-0 \
+            libasound2 \
+            && rm -rf /var/lib/apt/lists/*
 
           WORKDIR /app
-
-          # Copy project files
           COPY . .
-
-          # Install dependencies
           RUN bun install
-
-          EXPOSE 7860
           
-          # Start the server
+          # Force the production install of the underlying automation runner binaries
+          RUN bunx playwright install --with-deps || bunx puppeteer browsers install || true
+
+          EXPOSE 3000
           CMD ["bun", "start"]
           EOF
 
@@ -50,12 +56,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 5. Spin up the container, mapping runner host port 7860 to container port 3000
+      # 5. Spin up the container
       - name: Start Docker Container in Background
         run: |
           docker run -d -p 7860:3000 --name solver-container solver-app:latest
-          echo "Giving the Bun API server 10 seconds to spin up completely..."
-          sleep 10
+          echo "Waiting 15 seconds for browser automation engine to stabilize..."
+          sleep 15
+          
+          echo "=== Initial Container Status ==="
+          docker ps -a
+          
+          echo "=== Runtime Logs ==="
+          docker logs solver-container
 
       # 6. Execute the POST request, retry logic, cookie-extraction, and Upstash pipeline
       - name: Orchestrate API Tasks & Update Upstash
