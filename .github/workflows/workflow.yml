@@ -1,4 +1,4 @@
-name: Run External API Solver & Update Upstash
+name: Run External API Solver & Orchestrate Token Pipeline
 
 on:
   repository_dispatch:
@@ -9,50 +9,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Clone the OTHER person's public repository directly into the runner workspace
+      # 1. Clone the other person's public repository into the runner workspace
       - name: Checkout External Public Repo
         uses: actions/checkout@v4
         with:
           repository: 'D3-vin/Turnstile-Solver-NEW'
 
-      # 2. Dynamically create your Dockerfile inside their code folder
+      # 2. Dynamically drop your custom multi-stage Docker environment into their code directory
       - name: Create Dockerfile dynamically
         run: |
           cat << 'EOF' > Dockerfile
           FROM python:3.10-slim
 
-          # Update apt, install git, and patchright dependencies
           RUN apt-get update && apt-get install -y git \
               && pip install --no-cache-dir patchright \
               && patchright install-deps \
               && rm -rf /var/lib/apt/lists/*
 
-          # Set up Hugging Face non-root user
           RUN useradd -m -u 1000 user
           USER user
           ENV HOME=/home/user \
               PATH=/home/user/.local/bin:$PATH
           WORKDIR $HOME/app
 
-          # Copy the external repo's cloned files into the container
           COPY --chown=user:user . .
-
-          # Install requirements from the external repo
           RUN pip install --no-cache-dir -r requirements.txt
-
-          # Download Chromium browser binaries
           RUN python -m patchright install chromium
 
-          # Run their script
+          EXPOSE 7860
           CMD ["python", "api_solver.py", "--port", "7860"]
           EOF
 
-      # 3. Set up Docker Buildx for ultra-fast GitHub layer caching
+      # 3. Setup advanced layers cache
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 4. Build the image (Downloads Chromium/pip packages on 1st run, uses cache on 2nd)
-      - name: Build Docker Image with Cache
+      # 4. Build image using GitHub Actions native cache
+      - name: Build Docker Image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -61,17 +54,117 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 5. Run the container
-      - name: Run the Docker Container
-        run: docker run --rm solver-app:latest
+      # 5. Spin up the container in the BACKGROUND (-d) and expose port 7860
+      - name: Start Docker Container in Background
+        run: |
+          docker run -d -p 7860:7860 --name solver-container solver-app:latest
+          echo "Giving the API server 10 seconds to spin up completely..."
+          sleep 10
 
-      # 6. Overwrite the status at your constant Upstash Redis endpoint
-      - name: Update Upstash Redis
-        if: success()
+      # 6. Execute the polling, retry, cookie-extraction, and Upstash pipeline
+      - name: Orchestrate API Tasks & Update Upstash
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.Secrets.UPSTASH_REDIS_REST_TOKEN }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          curl -s -X POST \
-            "${UPSTASH_REDIS_REST_URL}/set/solver_status/success" \
-            -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}"
+          attempt=1
+          max_attempts=3
+          success=false
+          token=""
+
+          while [ $attempt -le $max_attempts ]; do
+            echo "========================================="
+            echo "STARTING ATTEMPT $attempt OF $max_attempts"
+            echo "========================================="
+            
+            # Step A: Initiate Task
+            INIT_RESP=$(curl -s "http://localhost:7860/turnstile?url=https://deltastudy.site/verify&sitekey=0x4AAAAAADnpjMgvQPlaYYog")
+            echo "Initial Response: $INIT_RESP"
+            TASK_ID=$(echo "$INIT_RESP" | jq -r '.task_id // empty')
+            
+            if [ -z "$TASK_ID" ] || [ "$TASK_ID" = "null" ]; then
+              echo "Failed to retrieve a valid task_id. Retrying attempt..."
+              attempt=$((attempt+1))
+              sleep 5
+              continue
+            fi
+            
+            echo "Task initialized successfully. ID: $TASK_ID"
+            
+            # Step B: Polling Loop (Max 60 seconds, check every 10 seconds = 6 total iterations)
+            polled=0
+            task_failed=false
+            
+            while [ $polled -lt 6 ]; do
+              echo "Waiting 10 seconds before polling..."
+              sleep 10
+              polled=$((polled+1))
+              
+              RESULT_RESP=$(curl -s "http://localhost:7860/result?id=$TASK_ID")
+              echo "Poll #$polled Response: $RESULT_RESP"
+              STATUS=$(echo "$RESULT_RESP" | jq -r '.status // empty')
+              
+              if [ "$STATUS" = "ready" ]; then
+                token=$(echo "$RESULT_RESP" | jq -r '.value')
+                echo "Task success! Extracted token value."
+                success=true
+                break 2 # Break completely out of both loops
+              elif [ "$STATUS" = "fail" ]; then
+                echo "Task reported status: FAIL."
+                task_failed=true
+                break # Break polling loop to trigger the next global attempt
+              elif [ "$STATUS" = "processing" ]; then
+                echo "Task is still processing..."
+              else
+                echo "Unknown or empty status received: '$STATUS'"
+              fi
+            done
+            
+            if [ "$task_failed" = "true" ] || [ "$success" = "false" ]; then
+              echo "Attempt $attempt timed out or encountered a CAPTCHA failure."
+              attempt=$((attempt+1))
+            fi
+          done
+
+          # Critical check: Did we secure a token?
+          if [ "$success" != "true" ]; then
+            echo "Error: Failed to obtain a token after $max_attempts global attempts."
+            exit 1
+          fi
+
+          echo "========================================="
+          echo "POSTING TOKEN TO DELTA AND EXTRACTING COOKIE"
+          echo "========================================="
+          
+          # Step C: Send token to Delta and isolate the 'set-cookie' header
+          # Note: If delta.site expects regular form fields instead of JSON, change payload to: -d "token=$token"
+          COOKIE=$(curl -sI -X POST https://deltastudy.site/api/turnstile/verify \
+            -H "Content-Type: application/json" \
+            -d "{\"token\":\"$token\"}" | grep -i '^set-cookie:' | head -n 1 | sed 's/^[^:]*:\s*//' | tr -d '\r\n')
+
+          if [ -z "$COOKIE" ]; then
+            echo "Error: Request succeeded but no 'set-cookie' header was returned from delta.site."
+            exit 1
+          fi
+          echo "Successfully captured target cookie payload."
+
+          echo "========================================="
+          echo "UPDATING UPSTASH REDIS CONSTANT ENDPOINT"
+          echo "========================================="
+          
+          # Step D: Overwrite the key using Upstash JSON Array syntax.
+          # This guarantees that special cookie characters (; = /) won't break URL structures.
+          curl -s -X POST "${UPSTASH_REDIS_REST_URL}" \
+            -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]"
+
+          echo "Upstash Redis update complete!"
+
+      # 7. Shutdown and clean up background containers unconditionally
+      - name: Container Shutdown
+        if: always()
+        run: |
+          echo "Tearing down application servers..."
+          docker stop solver-container || true
+          docker rm solver-container || true
