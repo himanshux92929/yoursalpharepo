@@ -16,14 +16,16 @@ jobs:
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      # 2. Dynamically drop the correct environment with browser support
+      # 2. Dynamically drop your custom Bun Docker environment with Chromium
       - name: Create Dockerfile dynamically
         run: |
           cat << 'EOF' > Dockerfile
           FROM oven/bun:1
 
-          # Install browser system dependencies
+          # Install Chromium and its required shared libraries
           RUN apt-get update && apt-get install -y \
+            chromium \
+            chromium-driver \
             libgbm1 \
             libnss3 \
             libatk-bridge2.0-0 \
@@ -31,17 +33,22 @@ jobs:
             libasound2 \
             && rm -rf /var/lib/apt/lists/*
 
+          # Tell chrome-launcher exactly where Chromium is installed on Linux
+          ENV CHROME_PATH=/usr/bin/chromium
+
           WORKDIR /app
+
+          # Copy project files
           COPY . .
+
+          # Install dependencies
           RUN bun install
-          
-          # Force the production install of the underlying automation runner binaries
-          RUN bunx playwright install --with-deps || bunx puppeteer browsers install || true
 
           EXPOSE 3000
+          
+          # Start the server
           CMD ["bun", "start"]
           EOF
-
       # 3. Setup advanced layers cache
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
