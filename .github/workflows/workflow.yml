@@ -56,20 +56,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 5. Spin up the container
-      - name: Start Docker Container in Background
+      # 5. Spin up the container using the host's native network stack
+      - name: Start Docker Container on Host Network
         run: |
-          docker run -d -p 7860:3000 --name solver-container solver-app:latest
-          echo "Waiting 15 seconds for browser automation engine to stabilize..."
+          docker run -d \
+            --network=host \
+            -e PORT=3000 \
+            -e HOST=127.0.0.1 \
+            --name solver-container solver-app:latest
+          
+          echo "Giving the Bun API server 15 seconds to fully initialize..."
           sleep 15
           
-          echo "=== Initial Container Status ==="
+          echo "=== Container Status Check ==="
           docker ps -a
           
-          echo "=== Runtime Logs ==="
-          docker logs solver-container
+          echo "=== Active Network Sockets ==="
+          sudo ss -tulpn | grep -E '3000|7860' || echo "No active listener on expected ports"
 
-      # 6. Execute the POST request, retry logic, cookie-extraction, and Upstash pipeline
+      # 6. Execute the POST request targeting port 3000 directly
       - name: Orchestrate API Tasks & Update Upstash
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -85,14 +90,13 @@ jobs:
             echo "STARTING ATTEMPT $attempt OF $max_attempts"
             echo "========================================="
             
-            # Send POST request to the local status endpoint
-            INIT_RESP=$(curl -s -X POST "http://localhost:7860/cloudflare" \
+            # Since we are using --network=host, hit port 3000 directly on localhost
+            INIT_RESP=$(curl -s -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
-              -d '{  "mode": "turnstile",  "domain": "https://deltastudy.site/verify",  "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}')
+              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}')
             
             echo "Response: $INIT_RESP"
             
-            # Parse the code and token directly from the response
             CODE=$(echo "$INIT_RESP" | jq -r '.code // empty')
             EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // empty')
             
@@ -100,7 +104,7 @@ jobs:
               token=$EXTRACTED_TOKEN
               echo "Task success! Extracted token value."
               success=true
-              break # Break out of the retry loop
+              break
             else
               echo "Attempt $attempt failed or returned invalid data. Retrying in 5 seconds..."
               attempt=$((attempt+1))
@@ -108,9 +112,10 @@ jobs:
             fi
           done
 
-          # Critical check: Did we secure a token?
           if [ "$success" != "true" ]; then
             echo "Error: Failed to obtain a token after $max_attempts global attempts."
+            echo "=== Final Container Engine Logs ==="
+            docker logs solver-container
             exit 1
           fi
 
@@ -118,7 +123,6 @@ jobs:
           echo "POSTING TOKEN AND EXTRACTING COOKIE"
           echo "========================================="
           
-          # Send token to the target and isolate the 'set-cookie' header
           COOKIE=$(curl -sI -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$token\"}" | grep -i '^set-cookie:' | head -n 1 | sed 's/^[^:]*:\s*//' | tr -d '\r\n')
@@ -133,7 +137,6 @@ jobs:
           echo "UPDATING UPSTASH REDIS CONSTANT ENDPOINT"
           echo "========================================="
           
-          # Overwrite the key using Upstash JSON Array syntax.
           curl -s -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
