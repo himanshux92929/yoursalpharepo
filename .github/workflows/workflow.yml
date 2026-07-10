@@ -3,6 +3,7 @@ name: Run External API Task & Orchestrate Pipeline
 on:
   repository_dispatch:
     types: [run-solver-task]
+  workflow_dispatch:
 
 jobs:
   run-and-report:
