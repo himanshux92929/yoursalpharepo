@@ -80,7 +80,7 @@ jobs:
             # Step A: Initiate Task
             INIT_RESP=$(curl -s "http://localhost:7860/turnstile?url=https://deltastudy.site/verify&sitekey=0x4AAAAAADnpjMgvQPlaYYog")
             echo "Initial Response: $INIT_RESP"
-            TASK_ID=$(echo "$INIT_RESP" | jq -r '.task_id // empty')
+            TASK_ID=$(echo "$INIT_RESP" | jq -r '.taskId // empty')
             
             if [ -z "$TASK_ID" ] || [ "$TASK_ID" = "null" ]; then
               echo "Failed to retrieve a valid task_id. Retrying attempt..."
