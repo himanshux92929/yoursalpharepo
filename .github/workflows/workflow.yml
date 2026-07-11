@@ -23,81 +23,91 @@ jobs:
       - name: Install Dependencies
         run: bun install
 
-      - name: Install Chromium and Xvfb (matching Hugging Face setup)
+      - name: Install Google Chrome Stable (bypass Snap entirely)
         run: |
+          # Remove any snap-based chromium packages that might be partially installed
+          sudo apt-get remove -y chromium-browser chromium-chromedriver 2>/dev/null || true
+          
+          # Install Google Chrome Stable from Google's own repo (clean .deb, no snap)
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] https://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
-          sudo apt-get install -y --fix-missing \
-            chromium-browser \
-            chromium-chromedriver \
-            xvfb \
-            wget \
-            gnupg \
-            ca-certificates
-          # Verify Chromium is available
-          which chromium-browser || echo "chromium-browser not found at expected path"
-          ls /usr/bin/chromium* 2>/dev/null || echo "No chromium binaries in /usr/bin"
-          echo "Chromium installed: $(chromium-browser --version 2>/dev/null || echo 'version check failed')"
+          sudo apt-get install -y --fix-missing google-chrome-stable xvfb
+          
+          # Verify the binary exists and show version
+          CHROME_PATH=$(which google-chrome-stable 2>/dev/null || echo "/usr/bin/google-chrome-stable")
+          echo "Chrome path: $CHROME_PATH"
+          $CHROME_PATH --version || echo "WARNING: Chrome binary not functional"
+          echo "CHROME_PATH=$CHROME_PATH" >> $GITHUB_ENV
 
-      - name: Start Server (Hugging Face style — clone, install already done, just start)
+      - name: Start Server & Wait for Readiness
         run: |
           pkill -f "bun start" 2>/dev/null || true
           pkill -f Xvfb 2>/dev/null || true
           sleep 2
 
-          # Start virtual display (same as Hugging Face setup)
           Xvfb :99 -screen 0 1024x768x24 &
-          echo "Xvfb started on :99"
-
-          # Set environment exactly like Dockerfile did
           export DISPLAY=:99
-          export CHROME_PATH=$(which chromium-browser 2>/dev/null || echo "/usr/bin/chromium-browser")
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+
           export PORT=3000
           export NODE_ENV=production
           export timeOut=180000
-
-          # Persist for subsequent steps
-          echo "DISPLAY=:99" >> $GITHUB_ENV
-          echo "CHROME_PATH=$CHROME_PATH" >> $GITHUB_ENV
           echo "PORT=3000" >> $GITHUB_ENV
           echo "timeOut=180000" >> $GITHUB_ENV
+          echo "NODE_ENV=production" >> $GITHUB_ENV
 
-          # Start server with output captured
           bun start > /tmp/server.log 2>&1 &
           SERVER_PID=$!
           echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
           echo "Server PID: $SERVER_PID"
 
-          # Wait for port — any HTTP response means it's alive
-          echo "Waiting for port 3000 to accept connections..."
-          for i in $(seq 1 60); do
+          echo "Waiting for port 3000..."
+          MAX_WAIT=120
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
             if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-              echo "Port 3000 accepting connections after $((i * 2))s"
+              echo "Port 3000 accepting connections after ${ELAPSED}s"
               break
             fi
             if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "ERROR: Server died during startup! Dumping log:"
-              cat /tmp/server.log
+              echo "ERROR: Server process died! Last 20 lines:"
+              tail -20 /tmp/server.log
               exit 1
             fi
             sleep 2
+            ELAPSED=$((ELAPSED + 2))
+            echo "Still waiting... (${ELAPSED}s elapsed)"
           done
 
-          # Wait for "Browser initialized" in logs
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "ERROR: Server never became ready after ${MAX_WAIT}s"
+            tail -20 /tmp/server.log
+            exit 1
+          fi
+
           echo "Waiting for browser initialization..."
-          for i in $(seq 1 40); do
+          MAX_BROWSER_WAIT=60
+          BROWSER_ELAPSED=0
+          while [ $BROWSER_ELAPSED -lt $MAX_BROWSER_WAIT ]; do
             if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
-              echo "Browser initialized after $((i * 2))s"
+              echo "Browser initialized after ${BROWSER_ELAPSED}s"
               break
             fi
             if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "ERROR: Server died during browser init! Dumping log:"
-              cat /tmp/server.log
+              echo "ERROR: Server died during browser init! Last 20 lines:"
+              tail -20 /tmp/server.log
               exit 1
             fi
             sleep 2
+            BROWSER_ELAPSED=$((BROWSER_ELAPSED + 2))
           done
 
-          echo "Server fully ready. No premature smoke test — first solve handles it."
+          if [ $BROWSER_ELAPSED -ge $MAX_BROWSER_WAIT ]; then
+            echo "WARNING: 'Browser initialized' not seen after ${MAX_BROWSER_WAIT}s — proceeding anyway"
+          fi
+
+          echo "Server fully ready. Browser is initialized, proceeding to solve."
 
       - name: Solve Turnstile
         env:
@@ -109,7 +119,6 @@ jobs:
           timeOut: 180000
           NODE_ENV: production
         run: |
-          # Server resurrection function (if Turnstile crashes it)
           restart_server() {
             echo ">>> Restarting server..."
             pkill -f "bun start" 2>/dev/null || true
@@ -117,7 +126,6 @@ jobs:
             bun start > /tmp/server.log 2>&1 &
             NEW_PID=$!
             echo "New server PID: $NEW_PID"
-            # Wait for port
             for j in $(seq 1 40); do
               if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
                 echo "Server port alive after $((j * 2))s"
@@ -125,7 +133,6 @@ jobs:
               fi
               sleep 2
             done
-            # Wait for browser
             for j in $(seq 1 30); do
               if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
                 echo "Browser re-initialized after $((j * 2))s"
@@ -142,13 +149,11 @@ jobs:
             echo "=== Turnstile Attempt $i of 5 ==="
             echo "=========================================="
 
-            # Check if server is still alive before attempting
             if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
               echo "Server unresponsive — restarting before attempt..."
               restart_server
             fi
 
-            # Hit the endpoint with a generous timeout (240s curl, 180s internal)
             echo "Calling /cloudflare (curl timeout: 240s)..."
             RESP=$(curl -s -m 240 -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
@@ -164,7 +169,6 @@ jobs:
               continue
             fi
 
-            # Extract token safely
             TOKEN=$(echo "$RESP" | jq -r '.token // empty' 2>/dev/null || echo "")
 
             if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
@@ -174,20 +178,18 @@ jobs:
               break
             fi
 
-            # No token — check if server errored internally
             echo "No token in response. Checking for server errors..."
             if echo "$RESP" | grep -qE "Timeout Error|error|500|crash"; then
               echo "Server-side error detected — restarting before next attempt"
               tail -20 /tmp/server.log
               restart_server
             else
-              echo "Unexpected response format — will retry without restart"
+              echo "Unexpected response — will retry without restart"
             fi
 
             sleep 5
           done
 
-          # Final verdict
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
             echo ""
             echo "=========================================="
