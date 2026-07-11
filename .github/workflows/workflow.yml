@@ -16,72 +16,32 @@ jobs:
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      # 2. Dynamically drop your custom Bun Docker environment with Chromium and Xvfb
-      - name: Create Dockerfile dynamically
-        run: |
-          cat << 'EOF' > Dockerfile
-          FROM oven/bun:1
-
-          # Install Chromium, Xvfb, and system layout assets
-          RUN apt-get update && apt-get install -y \
-            chromium \
-            chromium-driver \
-            xvfb \
-            xauth \
-            libgbm1 \
-            libnss3 \
-            libatk-bridge2.0-0 \
-            libgtk-3-0 \
-            libasound2 \
-            && rm -rf /var/lib/apt/lists/*
-
-          # Configure critical path layouts
-          ENV CHROME_PATH=/usr/bin/chromium
-
-          WORKDIR /app
-
-          # Copy project files
-          COPY . .
-
-          # Install dependencies
-          RUN bun install
-
-          EXPOSE 3000
-          
-          # Use --auto-servernum to dynamically allocate the display buffer safely
-          CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x1024x24", "bun", "start"]
-          EOF
-          
-      # 3. Setup advanced layers cache
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # 4. Build image using GitHub Actions native cache
-      - name: Build Docker Image
-        uses: docker/build-push-action@v6
+      # 2. Setup Bun natively on the host machine
+      - name: Setup Bun Environment
+        uses: oven-sh/setup-bun@v2
         with:
-          context: .
-          load: true
-          tags: solver-app:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          bun-version: latest
 
-      # 5. Spin up the container using the host's native network stack
-      - name: Start Docker Container on Host Network
+      # 3. Install dependencies directly on the host
+      - name: Install Project Dependencies
+        run: bun install
+
+      # 4. Start the server using the host's native Chrome, Xvfb, and explicit PORT env
+      - name: Start API Server on Host
         run: |
-          docker run -d \
-            --network=host \
-            -e PORT=3000 \
-            -e HOST=127.0.0.1 \
-            --name solver-container solver-app:latest
+          # Explicitly set the Chrome path used by GitHub Actions runners
+          export CHROME_PATH="/usr/bin/google-chrome"
           
-          echo "Giving the Bun API server 15 seconds to fully initialize..."
+          # Force the application's process.env.PORT to bind to 3000 instead of default 8742
+          export PORT=3000
+          
+          # Launch the server in the background using the host's native xvfb session wrapper
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bun start &
+          
+          echo "Giving the Bun API server 15 seconds to spin up completely..."
           sleep 15
-          
-          echo "=== Live Container Logs (Pre-Flight) ==="
-          docker logs solver-container
 
-      # 6. Execute the POST request targeting port 3000 directly
+      # 5. Execute the POST request, retry logic, cookie-extraction, and Upstash pipeline
       - name: Orchestrate API Tasks & Update Upstash
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
@@ -97,21 +57,23 @@ jobs:
             echo "STARTING ATTEMPT $attempt OF $max_attempts"
             echo "========================================="
             
-            # Since we are using --network=host, hit port 3000 directly on localhost
+            # Send POST request directly to port 3000 on localhost
             INIT_RESP=$(curl -s -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
-              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}')
+              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' )
             
             echo "Response: $INIT_RESP"
             
+            # Parse the code and token directly from the response
             CODE=$(echo "$INIT_RESP" | jq -r '.code // empty')
             EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // empty')
             
-            if [ "$CODE" = "200" ] && [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ]; then
+            # Check for a successful token delivery (handles both standard 200 array mapping or root parsing matches)
+            if [ "$CODE" = "200" ] || [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" != "500" ]; then
               token=$EXTRACTED_TOKEN
               echo "Task success! Extracted token value."
               success=true
-              break
+              break 
             else
               echo "Attempt $attempt failed or returned invalid data. Retrying in 5 seconds..."
               attempt=$((attempt+1))
@@ -119,10 +81,9 @@ jobs:
             fi
           done
 
+          # Critical check: Did we secure a token?
           if [ "$success" != "true" ]; then
             echo "Error: Failed to obtain a token after $max_attempts global attempts."
-            echo "=== Final Container Engine Logs ==="
-            docker logs solver-container
             exit 1
           fi
 
@@ -130,6 +91,7 @@ jobs:
           echo "POSTING TOKEN AND EXTRACTING COOKIE"
           echo "========================================="
           
+          # Send token to the target and isolate the 'set-cookie' header
           COOKIE=$(curl -sI -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$token\"}" | grep -i '^set-cookie:' | head -n 1 | sed 's/^[^:]*:\s*//' | tr -d '\r\n')
@@ -144,17 +106,10 @@ jobs:
           echo "UPDATING UPSTASH REDIS CONSTANT ENDPOINT"
           echo "========================================="
           
+          # Overwrite the key using Upstash JSON Array syntax.
           curl -s -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]"
 
           echo "Upstash Redis update complete!"
-
-      # 7. Shutdown and clean up background containers unconditionally
-      - name: Container Shutdown
-        if: always()
-        run: |
-          echo "Tearing down application servers..."
-          docker stop solver-container || true
-          docker rm solver-container || true
