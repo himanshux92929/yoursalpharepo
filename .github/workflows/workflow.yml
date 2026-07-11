@@ -1,11 +1,40 @@
-- name: Patch turnstile.ts and fix Chrome discovery
-  run: |
-    # Fix Chrome: chrome-launcher looks for 'google-chrome' or 'chromium-browser', not 'chromium'
-    sudo ln -sf /usr/bin/chromium /usr/bin/google-chrome
-    sudo ln -sf /usr/bin/chromium /usr/bin/chromium-browser
+name: Run External API Task & Orchestrate Pipeline
 
-    # Write the patched turnstile.ts using python3 to avoid heredoc whitespace corruption
-    python3 << 'PYEOF'
+on:
+  repository_dispatch:
+    types: [run-solver-task]
+  workflow_dispatch:
+
+jobs:
+  run-and-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout External Public Repo
+        uses: actions/checkout@v4
+        with:
+          repository: 'abhinai2244/cf-bypass'
+
+      - name: Setup Bun Environment
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies
+        run: bun install
+
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --fix-missing xvfb
+          echo "Chrome: $(which google-chrome-stable)"
+          google-chrome-stable --version
+          sudo ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome
+          sudo ln -sf /usr/bin/google-chrome-stable /usr/bin/chromium-browser
+
+      - name: Patch turnstile.ts
+        run: |
+          python3 << 'PYEOF'
 content = r"""const fs = require('fs');
 const path = require('path');
 
@@ -45,20 +74,20 @@ async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
 </body>
 </html>`;
 
-        // Remove default interception set by index.ts getPage() and replace with ours
         page.removeAllListeners("request");
         await page.setRequestInterception(true);
 
         page.on("request", async (request: any) => {
             const reqUrl = request.url();
 
-            // Block telemetry
             if (reqUrl.includes("challenges.cloudflare.com/reports/")) {
                 return request.abort();
             }
 
-            // Serve local api.js for ANY versioned turnstile api.js path
-            if (reqUrl.includes("challenges.cloudflare.com/turnstile/v0/b/") && reqUrl.endsWith("/api.js")) {
+            if (
+                reqUrl.includes("challenges.cloudflare.com/turnstile/v0/b/") &&
+                reqUrl.endsWith("/api.js")
+            ) {
                 const localPath = path.join(__dirname, '../js/api.js');
                 try {
                     const body = fs.readFileSync(localPath);
@@ -72,7 +101,6 @@ async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
                 }
             }
 
-            // Allow all Cloudflare challenge resources
             if (
                 reqUrl.includes("challenges.cloudflare.com") ||
                 reqUrl.includes("/cdn-cgi/challenge-platform/")
@@ -80,21 +108,17 @@ async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
                 return request.continue();
             }
 
-            // Allow everything else (needed for setContent to work)
             return request.continue();
         });
 
-        // Navigate to domain to establish the correct origin for Turnstile validation
         try {
             await page.goto(domain, { waitUntil: "domcontentloaded", timeout: 20000 });
         } catch {
-            // Ignore navigation errors — we overwrite content next
+            // ignore — we overwrite content next
         }
 
-        // Inject our HTML into the established origin
         await page.setContent(htmlContent, { waitUntil: "domcontentloaded" });
 
-        // Poll for the token that Turnstile writes into cf-turnstile-response
         const tokenPromise = (async () => {
             const start = Date.now();
             while (Date.now() - start < timeoutMs) {
@@ -124,6 +148,167 @@ export = turnstile;
 with open("src/lib/ends/turnstile.ts", "w") as f:
     f.write(content)
 
-print("turnstile.ts patched OK")
-print(open("src/lib/ends/turnstile.ts").read()[:200])
+print("Patch OK")
+print(open("src/lib/ends/turnstile.ts").read()[:300])
 PYEOF
+
+      - name: Start Server & Wait for Readiness
+        run: |
+          pkill -f "bun start" 2>/dev/null || true
+          pkill -f Xvfb 2>/dev/null || true
+          sleep 2
+
+          Xvfb :99 -screen 0 1024x768x24 &
+          export DISPLAY=:99
+          export CHROME_PATH=/usr/bin/google-chrome-stable
+          export PORT=3000
+          export NODE_ENV=production
+          export timeOut=60000
+
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "CHROME_PATH=/usr/bin/google-chrome-stable" >> $GITHUB_ENV
+          echo "PORT=3000" >> $GITHUB_ENV
+          echo "timeOut=60000" >> $GITHUB_ENV
+
+          bun start > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+
+          echo "Waiting for port 3000..."
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+              echo "Port 3000 alive after $((i * 2))s"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server died during startup! Log:"
+              cat /tmp/server.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for browser initialization..."
+          for i in $(seq 1 40); do
+            if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
+              echo "Browser initialized after $((i * 2))s"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server died during browser init! Log:"
+              cat /tmp/server.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Server ready."
+
+      - name: Solve Turnstile
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          DISPLAY: :99
+          CHROME_PATH: /usr/bin/google-chrome-stable
+          PORT: 3000
+          timeOut: 60000
+          NODE_ENV: production
+        run: |
+          TOKEN=""
+          for i in 1 2 3 4 5; do
+            echo ""
+            echo "=== Turnstile Attempt $i of 5 ==="
+
+            if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+              echo "Server down, restarting..."
+              pkill -f "bun start" 2>/dev/null || true
+              sleep 2
+              DISPLAY=:99 CHROME_PATH=/usr/bin/google-chrome-stable PORT=3000 timeOut=60000 NODE_ENV=production \
+                bun start > /tmp/server.log 2>&1 &
+              sleep 15
+            fi
+
+            echo "Calling /cloudflare (120s curl timeout)..."
+            RESP=$(curl -s -m 120 -X POST "http://127.0.0.1:3000/cloudflare" \
+              -H "Content-Type: application/json" \
+              -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1 || echo "CURL_FAILED")
+
+            echo "Response: ${RESP:0:500}"
+
+            if [ "$RESP" = "CURL_FAILED" ]; then
+              echo "Curl failed."
+              tail -20 /tmp/server.log
+              continue
+            fi
+
+            TOKEN=$(echo "$RESP" | jq -r '.token // empty' 2>/dev/null || echo "")
+
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+              echo ""
+              echo "TOKEN OBTAINED: ${TOKEN:0:60}..."
+              echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+              break
+            fi
+
+            echo "No token yet. Server log tail:"
+            tail -10 /tmp/server.log
+            sleep 5
+          done
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo ""
+            echo "ERROR: All 5 attempts failed."
+            echo "Full server log:"
+            cat /tmp/server.log
+            exit 1
+          fi
+
+          echo "Token captured."
+
+      - name: Extract Cookie
+        if: env.TOKEN != ''
+        run: |
+          echo "Exchanging token for cookie..."
+          COOKIE_RESP=$(curl -s -i -X POST https://deltastudy.site/api/turnstile/verify \
+            -H "Content-Type: application/json" \
+            -d "{\"token\":\"$TOKEN\"}" 2>&1 || echo "COOKIE_REQUEST_FAILED")
+
+          if [ "$COOKIE_RESP" = "COOKIE_REQUEST_FAILED" ]; then
+            echo "ERROR: Cookie exchange request failed"
+            exit 1
+          fi
+
+          COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -1 | cut -d';' -f1 | sed 's/^[^:]*:\s*//')
+
+          if [ -z "$COOKIE" ]; then
+            echo "ERROR: No Set-Cookie header found"
+            exit 1
+          fi
+
+          echo "Cookie: ${COOKIE:0:80}..."
+          echo "COOKIE=$COOKIE" >> $GITHUB_ENV
+
+      - name: Update Upstash
+        if: env.COOKIE != ''
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          echo "Storing cookie in Upstash..."
+          UPSTASH_RESP=$(curl -s -w "\n%{http_code}" -X POST "${UPSTASH_REDIS_REST_URL}" \
+            -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
+
+          HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
+          BODY=$(echo "$UPSTASH_RESP" | sed '$d')
+
+          echo "Upstash status: $HTTP_CODE"
+          echo "Upstash response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Upstash update failed"
+            exit 1
+          fi
+
+          echo "Cookie stored."
