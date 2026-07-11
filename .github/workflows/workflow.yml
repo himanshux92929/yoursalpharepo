@@ -45,8 +45,11 @@ jobs:
           export CHROME_PATH="/usr/bin/google-chrome-stable"
           export PORT=3000
           export NODE_ENV=production
+          export timeOut=180000
+          echo "timeOut=180000" >> $GITHUB_ENV
+          echo "PORT=3000" >> $GITHUB_ENV
+          echo "CHROME_PATH=/usr/bin/google-chrome-stable" >> $GITHUB_ENV
 
-          # Start server and capture output to a log file so we can grep it
           bun start > /tmp/server.log 2>&1 &
           SERVER_PID=$!
           echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
@@ -56,11 +59,11 @@ jobs:
           ELAPSED=0
           while [ $ELAPSED -lt $MAX_WAIT ]; do
             if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-              echo "Port 3000 accepting connections after ${ELAPSED}s"
+              echo "Port 3000 alive after ${ELAPSED}s"
               break
             fi
             if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "ERROR: Server process died! Last 20 lines of log:"
+              echo "ERROR: Server process died during startup! Last 20 lines of log:"
               tail -20 /tmp/server.log
               exit 1
             fi
@@ -75,7 +78,6 @@ jobs:
             exit 1
           fi
 
-          # Wait for browser initialization to complete
           echo "Waiting for browser initialization..."
           MAX_BROWSER_WAIT=60
           BROWSER_ELAPSED=0
@@ -94,52 +96,95 @@ jobs:
           done
 
           if [ $BROWSER_ELAPSED -ge $MAX_BROWSER_WAIT ]; then
-            echo "WARNING: Browser initialization log not found after ${MAX_BROWSER_WAIT}s"
-            echo "Server log so far:"
-            tail -20 /tmp/server.log
-            echo "Proceeding anyway—the solve loop will use its own timeout."
+            echo "WARNING: 'Browser initialized' not seen after ${MAX_BROWSER_WAIT}s — proceeding anyway"
           fi
 
-          echo "Server is ready. No premature smoke test—first solve attempt will handle it."
+          echo "Server fully ready."
 
       - name: Solve Turnstile
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          DISPLAY: :99
+          timeOut: 180000
+          PORT: 3000
+          CHROME_PATH: /usr/bin/google-chrome-stable
+          NODE_ENV: production
         run: |
+          # Helper: restart server if it's dead
+          restart_server() {
+            echo "Restarting server..."
+            pkill -f "bun start" 2>/dev/null || true
+            sleep 2
+            bun start > /tmp/server.log 2>&1 &
+            NEW_PID=$!
+            echo "New server PID: $NEW_PID"
+            # Wait for port
+            for j in $(seq 1 40); do
+              if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+                echo "Server back online after $((j * 3))s"
+                break
+              fi
+              sleep 3
+            done
+            # Wait for browser
+            for j in $(seq 1 20); do
+              if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
+                echo "Browser re-initialized after $((j * 3))s"
+                break
+              fi
+              sleep 3
+            done
+          }
+
           TOKEN=""
           for i in 1 2 3 4 5; do
             echo "=== Turnstile Attempt $i ==="
-            # First attempt gets 180s timeout; subsequent attempts also generous
-            TIMEOUT=180
-            RESP=$(curl -s -m $TIMEOUT -X POST "http://127.0.0.1:3000/cloudflare" \
+
+            # If server is dead, restart it
+            if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+              echo "Server appears dead — restarting before attempt $i..."
+              restart_server
+            fi
+
+            RESP=$(curl -s -m 240 -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
               -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1 || echo "CURL_FAILED")
-            
+
             echo "Raw response: ${RESP:0:500}"
-            
+
             if [ "$RESP" = "CURL_FAILED" ]; then
-              echo "Curl failed (timeout or connection refused) — retrying after 10s..."
-              sleep 10
+              echo "Curl failed (timeout or connection refused)"
+              echo "Server log tail:"
+              tail -15 /tmp/server.log
+              echo "Will restart server and retry..."
+              restart_server
               continue
             fi
 
             TOKEN=$(echo "$RESP" | jq -r '.token // empty' 2>/dev/null || echo "")
-            
+
             if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
               echo "Got token: ${TOKEN:0:50}..."
               echo "TOKEN=$TOKEN" >> $GITHUB_ENV
               break
             fi
-            
-            echo "No valid token in response, retrying after 10s..."
-            sleep 10
+
+            echo "No valid token in response — server may have errored internally"
+            echo "Server log tail:"
+            tail -15 /tmp/server.log
+            # If response contains a crash/error, restart the server for the next attempt
+            if echo "$RESP" | grep -qE "Timeout Error|code.*500|message.*Error"; then
+              echo "Detected server-side error — restarting server..."
+              restart_server
+            fi
+            sleep 5
           done
 
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
             echo "ERROR: Failed to obtain token after 5 attempts"
-            echo "Final server log for debugging:"
-            tail -30 /tmp/server.log
+            echo "Full server log:"
+            cat /tmp/server.log
             exit 1
           fi
 
@@ -150,7 +195,7 @@ jobs:
           COOKIE_RESP=$(curl -s -i -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$TOKEN\"}" 2>&1 || echo "COOKIE_REQUEST_FAILED")
-          
+
           if [ "$COOKIE_RESP" = "COOKIE_REQUEST_FAILED" ]; then
             echo "ERROR: Cookie exchange request failed"
             exit 1
@@ -160,12 +205,12 @@ jobs:
           echo "$COOKIE_RESP" | head -20
 
           COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -1 | cut -d';' -f1 | sed 's/^[^:]*:\s*//')
-          
+
           if [ -z "$COOKIE" ]; then
             echo "ERROR: No Set-Cookie header found in response"
             exit 1
           fi
-          
+
           echo "Cookie extracted: ${COOKIE:0:80}..."
           echo "COOKIE=$COOKIE" >> $GITHUB_ENV
 
@@ -180,16 +225,16 @@ jobs:
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
-          
+
           HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
           BODY=$(echo "$UPSTASH_RESP" | sed '$d')
-          
+
           echo "Upstash HTTP status: $HTTP_CODE"
           echo "Upstash response: $BODY"
-          
+
           if [ "$HTTP_CODE" != "200" ]; then
             echo "ERROR: Upstash update returned non-200 status"
             exit 1
           fi
-          
+
           echo "Cookie successfully stored in Upstash."
