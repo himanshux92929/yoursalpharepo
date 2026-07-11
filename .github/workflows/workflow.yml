@@ -32,8 +32,11 @@ jobs:
           # Explicitly set the Chrome path used by GitHub Actions runners
           export CHROME_PATH="/usr/bin/google-chrome"
           
-          # Force the application's process.env.PORT to bind to 3000 instead of default 8742
+          # Force the application's process.env.PORT to bind to 3000
           export PORT=3000
+          
+          # Force production mode to ensure app.listen() triggers
+          export NODE_ENV=production
           
           # Launch the server in the background using the host's native xvfb session wrapper
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bun start &
@@ -60,22 +63,27 @@ jobs:
             # Send POST request directly to port 3000 on localhost
             INIT_RESP=$(curl -s -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
-              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' )
+              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' || echo "CURL_FAILED")
             
             echo "Response: $INIT_RESP"
             
-            # Parse the code and token directly from the response
-            CODE=$(echo "$INIT_RESP" | jq -r '.code // empty')
-            EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // empty')
+            if [ "$INIT_RESP" = "CURL_FAILED" ]; then
+              echo "Network connection completely failed."
+              CODE="500"
+            else
+              # Parse the code and token safely from the response
+              CODE=$(echo "$INIT_RESP" | jq -r '.code // empty')
+              EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // empty')
+            fi
             
-            # Check for a successful token delivery (handles both standard 200 array mapping or root parsing matches)
-            if [ "$CODE" = "200" ] || [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" != "500" ]; then
+            # Catch token conditions safely
+            if [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" != "500" ]; then
               token=$EXTRACTED_TOKEN
               echo "Task success! Extracted token value."
               success=true
               break 
             else
-              echo "Attempt $attempt failed or returned invalid data. Retrying in 5 seconds..."
+              echo "Attempt $attempt failed or returned an empty response. Retrying in 5 seconds..."
               attempt=$((attempt+1))
               sleep 5
             fi
