@@ -26,23 +26,20 @@ jobs:
       - name: Install Project Dependencies
         run: bun install
 
-      # 4. Start the server using the host's native Chrome, Xvfb, and explicit PORT env
+      # 4. Start the server letting the app natively spawn its own Xvfb session
       - name: Start API Server on Host
         run: |
-          # Explicitly set the Chrome path used by GitHub Actions runners
+          # Use the pre-installed Chrome binary path on GitHub Actions runners
           export CHROME_PATH="/usr/bin/google-chrome"
-          
-          # Force the application's process.env.PORT to bind to 3000
           export PORT=3000
-          
-          # Force production mode to ensure app.listen() triggers
           export NODE_ENV=production
           
-          # Launch the server in the background using the host's native xvfb session wrapper
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bun start &
+          # Run directly WITHOUT xvfb-run. The codebase sets 'disableXvfb: false', 
+          # meaning it automatically launches its own internal Xvfb setup.
+          bun start &
           
-          echo "Giving the Bun API server 15 seconds to spin up completely..."
-          sleep 15
+          echo "Giving the Bun API server 20 seconds to spin up and hook the browser..."
+          sleep 20
 
       # 5. Execute the POST request, retry logic, cookie-extraction, and Upstash pipeline
       - name: Orchestrate API Tasks & Update Upstash
@@ -68,7 +65,7 @@ jobs:
             echo "Response: $INIT_RESP"
             
             if [ "$INIT_RESP" = "CURL_FAILED" ]; then
-              echo "Network connection completely failed."
+              echo "Network connection to API server failed."
               CODE="500"
             else
               # Parse the code and token safely from the response
@@ -76,7 +73,7 @@ jobs:
               EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // empty')
             fi
             
-            # Catch token conditions safely
+            # Verify token payload match conditions cleanly
             if [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" != "500" ]; then
               token=$EXTRACTED_TOKEN
               echo "Task success! Extracted token value."
