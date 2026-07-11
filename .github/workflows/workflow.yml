@@ -15,105 +15,255 @@ jobs:
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      - name: Build Docker Image (as recommended by README)
+      - name: Setup Bun Environment
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies
+        run: bun install
+
+      - name: Install Xvfb (Chrome is pre-installed on ubuntu-24.04)
         run: |
-          echo "Building Docker image..."
-          docker build -t cf-bypass-solver .
-          echo "Docker image built successfully."
+          sudo apt-get update
+          sudo apt-get install -y --fix-missing xvfb
+          echo "Chrome: $(which google-chrome-stable)"
+          google-chrome-stable --version
 
-      - name: Start Docker Container
+      - name: Patch turnstile.ts — fix timeout crash + add ghost click
         run: |
-          # Clean up any old container
-          docker rm -f cf-bypass-container 2>/dev/null || true
+          cat > src/lib/ends/turnstile.ts << 'ENDOFFILE'
+          const fs = require('fs');
+          const path = require('path');
 
-          # Run the container in detached mode, mapping port 3000
-          docker run -d \
-            --name cf-bypass-container \
-            -p 3000:3000 \
-            -e PORT=3000 \
-            -e NODE_ENV=production \
-            -e timeOut=180000 \
-            cf-bypass-solver
+          interface TurnstileData {
+              domain: string;
+              siteKey: string;
+              proxy?: {
+                  username?: string;
+                  password?: string;
+              };
+          }
 
-          echo "Container started. Waiting for server readiness..."
+          async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
+              if (!domain) throw new Error("Missing domain parameter");
+              if (!siteKey) throw new Error("Missing siteKey parameter");
 
-          # Wait for port 3000 inside the container
+              const timeoutMs = (global as any).timeOut || 60000;
+              let timedOut = false;
+              let timeoutTimer: ReturnType<typeof setTimeout>;
+
+              const timeoutPromise = new Promise<never>((_, reject) => {
+                  timeoutTimer = setTimeout(() => {
+                      timedOut = true;
+                      reject(new Error("Timeout reached after " + timeoutMs + "ms"));
+                  }, timeoutMs);
+              });
+
+              try {
+                  if (proxy?.username && proxy?.password) {
+                      await page.authenticate({
+                          username: proxy.username,
+                          password: proxy.password,
+                      });
+                  }
+
+                  const htmlContent = `
+                  <!DOCTYPE html>
+                  <html>
+                  <head><meta charset="utf-8"></head>
+                  <body>
+                  <div class="turnstile"></div>
+                  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" defer></script>
+                  <script>
+                    window.onloadTurnstileCallback = function () {
+                      turnstile.render('.turnstile', {
+                        sitekey: '${siteKey}',
+                        callback: function (token) {
+                          var c = document.createElement('input');
+                          c.type = 'hidden';
+                          c.name = 'cf-response';
+                          c.value = token;
+                          document.body.appendChild(c);
+                        },
+                      });
+                    };
+                  </script>
+                  </body>
+                  </html>
+                  `;
+
+                  await page.setRequestInterception(true);
+                  page.removeAllListeners("request");
+                  page.on("request", async (request: any) => {
+                      const reqUrl = request.url();
+                      if ([domain, domain + "/"].includes(reqUrl) && request.resourceType() === "document") {
+                          await request.respond({
+                              status: 200,
+                              contentType: "text/html",
+                              body: htmlContent,
+                          });
+                      } else if (reqUrl.includes("challenges.cloudflare.com/reports/v0/post")) {
+                          await request.abort();
+                      } else if (reqUrl.includes("challenges.cloudflare.com/turnstile/v0/b/88d68f5d5ea3/api.js")) {
+                          const localPath = path.join(__dirname, '../js/api.js');
+                          try {
+                              const body = fs.readFileSync(localPath);
+                              await request.respond({
+                                  status: 200,
+                                  contentType: 'application/javascript',
+                                  body: body
+                              });
+                          } catch (e) {
+                              console.error("Failed to serve local api.js:", e);
+                              await request.continue();
+                          }
+                      } else if (
+                          reqUrl.includes("challenges.cloudflare.com") ||
+                          reqUrl.includes("/cdn-cgi/challenge-platform/")
+                      ) {
+                          await request.continue();
+                      } else {
+                          await request.abort();
+                      }
+                  });
+
+                  await page.goto(domain, { waitUntil: "domcontentloaded" });
+
+                  // Wait for the Turnstile iframe to appear, then click it like a human
+                  try {
+                      await page.waitForSelector('.turnstile iframe', { timeout: 15000 });
+                      await new Promise(r => setTimeout(r, 2000));
+
+                      const turnstileDiv = await page.$('.turnstile');
+                      if (turnstileDiv) {
+                          const box = await turnstileDiv.boundingBox();
+                          if (box) {
+                              const x = box.x + box.width / 2;
+                              const y = box.y + box.height / 2;
+                              await page.mouse.move(x - 10, y - 5, { steps: 5 });
+                              await page.mouse.click(x, y, { delay: 100 });
+                              console.log("Clicked Turnstile widget at", x, y);
+                          }
+                      }
+                  } catch (clickErr) {
+                      console.log("Click skipped (non-interactive or already solved):", clickErr.message);
+                  }
+
+                  // Race: token appearance vs timeout
+                  const tokenPromise = (async () => {
+                      await page.waitForSelector('[name="cf-response"]', { timeout: 0 });
+                      const token = await page.evaluate(() => {
+                          try {
+                              return document.querySelector('[name="cf-response"]')?.getAttribute('value');
+                          } catch {
+                              return null;
+                          }
+                      });
+                      if (!token || token.length < 10) throw new Error("Token invalid");
+                      return token;
+                  })();
+
+                  const token = await Promise.race([tokenPromise, timeoutPromise]);
+                  clearTimeout(timeoutTimer!);
+                  return token;
+
+              } catch (e) {
+                  clearTimeout(timeoutTimer!);
+                  throw e;
+              }
+          }
+
+          export = turnstile;
+          ENDOFFILE
+          echo "turnstile.ts patched successfully."
+          head -5 src/lib/ends/turnstile.ts
+
+      - name: Start Server & Wait for Readiness
+        run: |
+          pkill -f "bun start" 2>/dev/null || true
+          pkill -f Xvfb 2>/dev/null || true
+          sleep 2
+
+          Xvfb :99 -screen 0 1024x768x24 &
+          export DISPLAY=:99
+          export CHROME_PATH=/usr/bin/google-chrome-stable
+          export PORT=3000
+          export NODE_ENV=production
+          export timeOut=60000
+
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "CHROME_PATH=/usr/bin/google-chrome-stable" >> $GITHUB_ENV
+          echo "PORT=3000" >> $GITHUB_ENV
+          echo "timeOut=60000" >> $GITHUB_ENV
+
+          bun start > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+
+          echo "Waiting for port 3000..."
           for i in $(seq 1 60); do
             if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-              echo "Port 3000 accepting connections after $((i * 2))s"
+              echo "Port 3000 alive after $((i * 2))s"
               break
             fi
-            # Check if container is still running
-            if ! docker ps | grep -q cf-bypass-container; then
-              echo "ERROR: Container died during startup! Logs:"
-              docker logs cf-bypass-container
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server died during startup! Log:"
+              cat /tmp/server.log
               exit 1
             fi
             sleep 2
           done
 
-          # Wait for "Browser initialized" in container logs
-          echo "Waiting for browser initialization inside container..."
+          echo "Waiting for browser initialization..."
           for i in $(seq 1 40); do
-            if docker logs cf-bypass-container 2>&1 | grep -q "Browser initialized"; then
+            if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
               echo "Browser initialized after $((i * 2))s"
               break
             fi
-            if ! docker ps | grep -q cf-bypass-container; then
-              echo "ERROR: Container died during browser init! Logs:"
-              docker logs cf-bypass-container
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server died during browser init! Log:"
+              cat /tmp/server.log
               exit 1
             fi
             sleep 2
           done
 
-          echo "Server fully ready inside Docker container."
+          echo "Server ready."
 
       - name: Solve Turnstile
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          DISPLAY: :99
+          CHROME_PATH: /usr/bin/google-chrome-stable
+          PORT: 3000
+          timeOut: 60000
+          NODE_ENV: production
         run: |
           TOKEN=""
           for i in 1 2 3 4 5; do
             echo ""
-            echo "=========================================="
             echo "=== Turnstile Attempt $i of 5 ==="
-            echo "=========================================="
 
-            # Check if container is alive
-            if ! docker ps | grep -q cf-bypass-container; then
-              echo "Container died! Restarting..."
-              docker rm -f cf-bypass-container 2>/dev/null || true
-              docker run -d \
-                --name cf-bypass-container \
-                -p 3000:3000 \
-                -e PORT=3000 \
-                -e NODE_ENV=production \
-                -e timeOut=180000 \
-                cf-bypass-solver
-              echo "Waiting for container to be ready..."
+            if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+              echo "Server down, restarting..."
+              pkill -f "bun start" 2>/dev/null || true
+              sleep 2
+              bun start > /tmp/server.log 2>&1 &
               sleep 15
-              for j in $(seq 1 30); do
-                if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-                  echo "Container back online after $((j * 2))s"
-                  break
-                fi
-                sleep 2
-              done
             fi
 
-            echo "Calling /cloudflare (curl timeout: 240s)..."
-            RESP=$(curl -s -m 240 -X POST "http://127.0.0.1:3000/cloudflare" \
+            echo "Calling /cloudflare (120s curl timeout)..."
+            RESP=$(curl -s -m 120 -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
               -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1 || echo "CURL_FAILED")
 
-            echo "Response preview: ${RESP:0:400}"
+            echo "Response: ${RESP:0:500}"
 
             if [ "$RESP" = "CURL_FAILED" ]; then
-              echo "Curl returned nothing (timeout or connection refused)"
-              echo "Container logs (last 20 lines):"
-              docker logs cf-bypass-container 2>&1 | tail -20
+              echo "Curl failed."
+              tail -20 /tmp/server.log
               continue
             fi
 
@@ -126,53 +276,42 @@ jobs:
               break
             fi
 
-            echo "No valid token in response."
-            if echo "$RESP" | grep -qE "Timeout Error|error|500"; then
-              echo "Server-side error detected — container logs:"
-              docker logs cf-bypass-container 2>&1 | tail -20
-            fi
-
-            sleep 10
+            echo "No token yet. Server log tail:"
+            tail -10 /tmp/server.log
+            sleep 5
           done
 
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
             echo ""
-            echo "=========================================="
-            echo "ERROR: All 5 attempts failed to get token"
-            echo "=========================================="
-            echo "Full container logs:"
-            docker logs cf-bypass-container 2>&1
+            echo "ERROR: All 5 attempts failed."
+            echo "Full server log:"
+            cat /tmp/server.log
             exit 1
           fi
 
-          echo "Token captured and stored in GITHUB_ENV"
+          echo "Token captured."
 
       - name: Extract Cookie
         if: env.TOKEN != ''
         run: |
-          echo "Exchanging Turnstile token for session cookie..."
+          echo "Exchanging token for cookie..."
           COOKIE_RESP=$(curl -s -i -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$TOKEN\"}" 2>&1 || echo "COOKIE_REQUEST_FAILED")
 
           if [ "$COOKIE_RESP" = "COOKIE_REQUEST_FAILED" ]; then
-            echo "ERROR: Cookie exchange request failed entirely"
+            echo "ERROR: Cookie exchange request failed"
             exit 1
           fi
-
-          echo "Response headers from cookie exchange:"
-          echo "$COOKIE_RESP" | head -25
 
           COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -1 | cut -d';' -f1 | sed 's/^[^:]*:\s*//')
 
           if [ -z "$COOKIE" ]; then
-            echo "ERROR: No Set-Cookie header found in response"
-            echo "Full response:"
-            echo "$COOKIE_RESP"
+            echo "ERROR: No Set-Cookie header found"
             exit 1
           fi
 
-          echo "Cookie extracted: ${COOKIE:0:80}..."
+          echo "Cookie: ${COOKIE:0:80}..."
           echo "COOKIE=$COOKIE" >> $GITHUB_ENV
 
       - name: Update Upstash
@@ -181,7 +320,7 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          echo "Storing cookie in Upstash Redis..."
+          echo "Storing cookie in Upstash..."
           UPSTASH_RESP=$(curl -s -w "\n%{http_code}" -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -190,12 +329,12 @@ jobs:
           HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
           BODY=$(echo "$UPSTASH_RESP" | sed '$d')
 
-          echo "Upstash HTTP status: $HTTP_CODE"
-          echo "Upstash response body: $BODY"
+          echo "Upstash status: $HTTP_CODE"
+          echo "Upstash response: $BODY"
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Upstash update returned non-200 status ($HTTP_CODE)"
+            echo "ERROR: Upstash update failed"
             exit 1
           fi
 
-          echo "✓ Cookie successfully stored in Upstash as 'solver_cookie'"
+          echo "✓ Cookie stored."
