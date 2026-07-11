@@ -23,44 +23,68 @@ jobs:
       - name: Install Dependencies
         run: bun install
 
-      - name: Install Xvfb and Chrome dependencies
+      - name: Install Xvfb and Chrome
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libatk-bridge2.0-0
-          google-chrome --version || echo "Chrome not found, installing..."
+          
+          # Install Chrome stable
           wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
           sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
+          
+          # Verify Chrome is executable
+          google-chrome-stable --version
 
-      - name: Start API Server with Xvfb
+      - name: Start API Server with Xvfb and Debug
         run: |
+          # Kill any leftover processes
+          pkill -f "bun start" || true
+          pkill -f Xvfb || true
+          
           export CHROME_PATH="/usr/bin/google-chrome-stable"
           export PORT=3000
           export NODE_ENV=production
+          export DEBUG=*
           
-          # Force Xvfb to run properly
-          Xvfb :99 -screen 0 1024x768x24 &
+          # Start Xvfb with proper display
+          Xvfb :99 -screen 0 1024x768x24 -ac &
           export DISPLAY=:99
           
-          # Start the server with explicit Xvfb flag
-          bun start --disableXvfb=false &
+          # Wait for Xvfb
+          sleep 3
           
-          # Wait with health check pings
-          echo "Waiting for server to be ready..."
-          for i in {1..30}; do
-            if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/health | grep -q "200"; then
-              echo "Server is ready!"
+          # Start the server with verbose output
+          bun start --disableXvfb=false --verbose 2>&1 | tee server.log &
+          SERVER_PID=$!
+          
+          # Health check with longer timeout and more attempts
+          echo "Waiting for server on port 3000..."
+          for i in {1..40}; do
+            if ss -lnt | grep -q ":3000"; then
+              echo "✅ Port 3000 is listening!"
               break
             fi
-            echo "Attempt $i/30 - waiting..."
-            sleep 2
+            echo "Attempt $i/40 - waiting for port..."
+            sleep 3
           done
+          
+          # Additional health check
+          if ! ss -lnt | grep -q ":3000"; then
+            echo "❌ Server failed to bind to port 3000"
+            echo "Server logs:"
+            cat server.log || echo "No logs found"
+            exit 1
+          fi
+          
+          echo "Server started with PID: $SERVER_PID"
 
       - name: Orchestrate API Tasks & Update Upstash
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        timeout-minutes: 10
         run: |
           attempt=1
           max_attempts=5
@@ -72,56 +96,82 @@ jobs:
             echo "STARTING ATTEMPT $attempt OF $max_attempts"
             echo "========================================="
             
-            # Add timeout and better error handling
-            INIT_RESP=$(curl -s -m 60 -X POST "http://127.0.0.1:3000/cloudflare" \
+            # Check if server is actually responding to any request first
+            if ! curl -s -m 10 -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/health | grep -q "200"; then
+              echo "❌ Server not responding to health check"
+              echo "Checking server logs..."
+              ps aux | grep bun
+              cat server.log || echo "No logs available"
+              attempt=$((attempt+1))
+              sleep 10
+              continue
+            fi
+            
+            # Send the solve request with much longer timeout
+            echo "Sending solve request to /cloudflare..."
+            INIT_RESP=$(curl -s -m 120 -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
               -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1)
             
             CURL_EXIT=$?
             
             if [ $CURL_EXIT -ne 0 ] || [ -z "$INIT_RESP" ]; then
-              echo "CURL failed with exit code $CURL_EXIT"
+              echo "❌ CURL failed with exit code $CURL_EXIT"
               echo "Response: $INIT_RESP"
               attempt=$((attempt+1))
-              sleep 10
+              sleep 15
               continue
             fi
             
-            echo "Raw response: $INIT_RESP"
+            echo "Raw response (first 500 chars):"
+            echo "$INIT_RESP" | head -c 500
+            echo ""
             
-            # Safely parse JSON without failing on empty
+            # Parse JSON
             if echo "$INIT_RESP" | jq -e . >/dev/null 2>&1; then
               CODE=$(echo "$INIT_RESP" | jq -r '.code // "500"')
               EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // ""')
               MESSAGE=$(echo "$INIT_RESP" | jq -r '.message // ""')
             else
-              echo "Invalid JSON response"
+              echo "❌ Invalid JSON response"
               attempt=$((attempt+1))
               sleep 10
               continue
             fi
             
             echo "Parsed code: $CODE"
-            echo "Parsed token: ${EXTRACTED_TOKEN:0:20}..."
+            echo "Parsed token: ${EXTRACTED_TOKEN:0:30}..."
             
-            # Validate token properly
+            # Validate
             if [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" = "200" ]; then
               token="$EXTRACTED_TOKEN"
-              echo "✅ Task success! Valid token extracted."
+              echo "✅ Token obtained successfully!"
               success=true
               break
             else
               echo "❌ Attempt $attempt failed. Code: $CODE, Message: $MESSAGE"
+              
+              # Check for specific Chrome errors
+              if echo "$MESSAGE" | grep -qi "chrome"; then
+                echo "🔄 Chrome-related error detected - restarting server..."
+                pkill -f "bun start" || true
+                sleep 5
+                bun start --disableXvfb=false --verbose > server.log 2>&1 &
+                sleep 20
+              fi
+              
               attempt=$((attempt+1))
               if [ $attempt -le $max_attempts ]; then
-                echo "Retrying in 10 seconds..."
-                sleep 10
+                echo "Retrying in 15 seconds..."
+                sleep 15
               fi
             fi
           done
 
           if [ "$success" != "true" ]; then
             echo "❌ Error: Failed to obtain a token after $max_attempts attempts."
+            echo "Final server log:"
+            cat server.log || echo "No logs"
             exit 1
           fi
 
@@ -129,7 +179,6 @@ jobs:
           echo "POSTING TOKEN AND EXTRACTING COOKIE"
           echo "========================================="
           
-          # Better cookie extraction with timeout
           COOKIE_RESP=$(curl -s -m 30 -i -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$token\"}" 2>&1)
@@ -137,19 +186,18 @@ jobs:
           COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -n 1 | sed 's/^[^:]*:\s*//' | tr -d '\r\n' | cut -d';' -f1)
           
           if [ -z "$COOKIE" ]; then
-            echo "❌ Error: No 'set-cookie' header found."
-            echo "Full response headers:"
-            echo "$COOKIE_RESP" | head -20
+            echo "❌ Error: No set-cookie header."
+            echo "Response headers:"
+            echo "$COOKIE_RESP" | head -30
             exit 1
           fi
           
-          echo "✅ Successfully captured cookie: ${COOKIE:0:50}..."
+          echo "✅ Cookie captured: ${COOKIE:0:50}..."
 
           echo "========================================="
           echo "UPDATING UPSTASH REDIS"
           echo "========================================="
           
-          # Upstash SET operation with proper error handling
           UPSTASH_RESP=$(curl -s -m 30 -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -158,6 +206,5 @@ jobs:
           if echo "$UPSTASH_RESP" | jq -e '.result == "OK"' >/dev/null 2>&1; then
             echo "✅ Upstash update successful!"
           else
-            echo "⚠️ Upstash update may have failed: $UPSTASH_RESP"
-            # Don't exit - cookie already captured
+            echo "⚠️ Upstash update: $UPSTASH_RESP"
           fi
