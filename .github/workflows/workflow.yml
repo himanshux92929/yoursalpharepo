@@ -22,7 +22,7 @@ jobs:
           cat << 'EOF' > Dockerfile
           FROM oven/bun:1
 
-          # Install Chromium, Xvfb, and all necessary GUI layout/rendering libraries
+          # Install Chromium, Xvfb, and system layout assets
           RUN apt-get update && apt-get install -y \
             chromium \
             chromium-driver \
@@ -35,9 +35,8 @@ jobs:
             libasound2 \
             && rm -rf /var/lib/apt/lists/*
 
-          # Configure environment variables for Chromium and headless display
+          # Configure critical path layouts
           ENV CHROME_PATH=/usr/bin/chromium
-          ENV DISPLAY=:99
 
           WORKDIR /app
 
@@ -49,8 +48,8 @@ jobs:
 
           EXPOSE 3000
           
-          # Wrap the startup command with xvfb-run to automatically spin up the virtual screen
-          CMD ["xvfb-run", "--server-args=-screen 0 1280x1024x24", "bun", "start"]
+          # Use --auto-servernum to dynamically allocate the display buffer safely
+          CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x1024x24", "bun", "start"]
           EOF
           
       # 3. Setup advanced layers cache
@@ -79,11 +78,8 @@ jobs:
           echo "Giving the Bun API server 15 seconds to fully initialize..."
           sleep 15
           
-          echo "=== Container Status Check ==="
-          docker ps -a
-          
-          echo "=== Active Network Sockets ==="
-          sudo ss -tulpn | grep -E '3000|7860' || echo "No active listener on expected ports"
+          echo "=== Live Container Logs (Pre-Flight) ==="
+          docker logs solver-container
 
       # 6. Execute the POST request targeting port 3000 directly
       - name: Orchestrate API Tasks & Update Upstash
