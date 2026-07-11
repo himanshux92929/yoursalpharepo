@@ -16,16 +16,18 @@ jobs:
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      # 2. Dynamically drop your custom Bun Docker environment with Chromium
+      # 2. Dynamically drop your custom Bun Docker environment with Chromium and Xvfb
       - name: Create Dockerfile dynamically
         run: |
           cat << 'EOF' > Dockerfile
           FROM oven/bun:1
 
-          # Install Chromium and its required shared libraries
+          # Install Chromium, Xvfb, and all necessary GUI layout/rendering libraries
           RUN apt-get update && apt-get install -y \
             chromium \
             chromium-driver \
+            xvfb \
+            xauth \
             libgbm1 \
             libnss3 \
             libatk-bridge2.0-0 \
@@ -33,8 +35,9 @@ jobs:
             libasound2 \
             && rm -rf /var/lib/apt/lists/*
 
-          # Tell chrome-launcher exactly where Chromium is installed on Linux
+          # Configure environment variables for Chromium and headless display
           ENV CHROME_PATH=/usr/bin/chromium
+          ENV DISPLAY=:99
 
           WORKDIR /app
 
@@ -46,9 +49,10 @@ jobs:
 
           EXPOSE 3000
           
-          # Start the server
-          CMD ["bun", "start"]
+          # Wrap the startup command with xvfb-run to automatically spin up the virtual screen
+          CMD ["xvfb-run", "--server-args=-screen 0 1280x1024x24", "bun", "start"]
           EOF
+          
       # 3. Setup advanced layers cache
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
