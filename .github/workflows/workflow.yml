@@ -29,12 +29,25 @@ jobs:
           sudo apt-get install -y xvfb
           google-chrome-stable --version || sudo apt-get install -y google-chrome-stable
 
-      - name: Start Server
+      - name: Patch Server to Force Chrome Path
+        run: |
+          # Check what the server actually expects
+          echo "Checking src/index.ts for chrome path config..."
+          grep -n "chrome" src/index.ts || echo "No chrome refs in index"
+          grep -n "executablePath" src/**/*.ts || echo "No executablePath found"
+          grep -n "CHROME_PATH" src/**/*.ts || echo "No CHROME_PATH found"
+          
+          # Force the environment variable explicitly before starting
+          export CHROME_PATH="/usr/bin/google-chrome-stable"
+          export PUPPETEER_EXECUTABLE_PATH="/usr/bin/google-chrome-stable"
+
+      - name: Start Server with Explicit Chrome Path
         run: |
           pkill -f "bun start" || true
           pkill -f Xvfb || true
           
           export CHROME_PATH="/usr/bin/google-chrome-stable"
+          export PUPPETEER_EXECUTABLE_PATH="/usr/bin/google-chrome-stable"
           export PORT=3000
           export NODE_ENV=production
           
@@ -42,26 +55,29 @@ jobs:
           export DISPLAY=:99
           sleep 3
           
+          # Start with explicit env
+          CHROME_PATH="/usr/bin/google-chrome-stable" \
+          PUPPETEER_EXECUTABLE_PATH="/usr/bin/google-chrome-stable" \
           bun start 2>&1 | tee server.log &
           
           echo "Waiting for port 3000..."
           for i in {1..40}; do
             if ss -lnt | grep -q ":3000"; then
-              echo "✅ Port ready - waiting extra 15s for Chrome to be ready"
-              sleep 15
+              echo "✅ Port ready"
+              sleep 20
               break
             fi
             sleep 3
           done
 
-      - name: Solve Turnstile
+      - name: Solve Turnstile with Keep-Alive
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          max_attempts=6
-          delay=20
+          max_attempts=3
+          delay=30
           token=""
           
           for attempt in $(seq 1 $max_attempts); do
@@ -69,18 +85,25 @@ jobs:
             echo "ATTEMPT $attempt/$max_attempts"
             echo "========================================="
             
-            # Let the first attempt have an extra long timeout since Chrome hasn't launched
-            TIMEOUT=180
-            if [ $attempt -eq 1 ]; then
-              TIMEOUT=240
-              echo "First attempt - giving Chrome extra time to boot (240s)..."
-            fi
+            # Write request to temp file to avoid shell escaping issues
+            cat > payload.json << 'EOF'
+            {
+              "mode": "turnstile",
+              "domain": "https://deltastudy.site/verify",
+              "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"
+            }
+            EOF
             
-            RESP=$(curl -s -m $TIMEOUT -X POST "http://127.0.0.1:3000/cloudflare" \
+            echo "Sending request with Connection: keep-alive and long timeout..."
+            
+            # Use curl with explicit keep-alive and no -m flag (use --max-time)
+            RESP=$(curl -s --max-time 300 --connect-timeout 60 \
+              -H "Connection: keep-alive" \
               -H "Content-Type: application/json" \
-              -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1)
+              -X POST "http://127.0.0.1:3000/cloudflare" \
+              -d @payload.json 2>&1)
             
-            echo "Response: ${RESP:0:500}"
+            echo "Response: ${RESP:0:600}"
             
             if echo "$RESP" | jq -e . >/dev/null 2>&1; then
               CODE=$(echo "$RESP" | jq -r '.code // ""')
@@ -91,21 +114,39 @@ jobs:
                 echo "✅ Token captured!"
                 break
               else
-                echo "❌ Code: $CODE, Message: $(echo "$RESP" | jq -r '.message // "unknown"')"
+                echo "❌ Code: $CODE"
+                echo "Message: $(echo "$RESP" | jq -r '.message // "unknown"')"
               fi
             else
-              echo "❌ Invalid response"
+              echo "❌ Invalid JSON or empty response"
+              echo "Server log last 20 lines:"
+              tail -20 server.log
+            fi
+            
+            # On first failure, restart the server fresh
+            if [ $attempt -eq 1 ]; then
+              echo "🔄 Restarting server..."
+              pkill -f "bun start" || true
+              pkill -f Xvfb || true
+              Xvfb :99 -screen 0 1024x768x24 &
+              export DISPLAY=:99
+              sleep 3
+              CHROME_PATH="/usr/bin/google-chrome-stable" \
+              PUPPETEER_EXECUTABLE_PATH="/usr/bin/google-chrome-stable" \
+              bun start 2>&1 | tee server.log &
+              echo "Waiting 30s for fresh server..."
+              sleep 30
             fi
             
             echo "Retrying in ${delay}s..."
             sleep $delay
-            delay=$((delay + 10))
-            [ $delay -gt 90 ] && delay=90
+            delay=$((delay + 30))
           done
           
           if [ -z "$token" ]; then
             echo "❌ Failed"
-            tail -50 server.log
+            echo "=== FULL SERVER LOG ==="
+            cat server.log
             exit 1
           fi
           
@@ -113,7 +154,7 @@ jobs:
           echo "EXTRACTING COOKIE"
           echo "========================================="
           
-          COOKIE_RESP=$(curl -s -m 30 -i -X POST https://deltastudy.site/api/turnstile/verify \
+          COOKIE_RESP=$(curl -s --max-time 30 -i -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$token\"}")
           
@@ -127,7 +168,7 @@ jobs:
           
           echo "✅ Cookie: ${COOKIE:0:60}..."
           
-          curl -s -X POST "${UPSTASH_REDIS_REST_URL}" \
+          curl -s --max-time 30 -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]"
