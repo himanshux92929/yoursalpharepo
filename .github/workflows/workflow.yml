@@ -26,12 +26,11 @@ jobs:
       - name: Install Xvfb and Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libxcomposite1 libxdamage1 libxrandr2 libgbm1
+          sudo apt-get install -y xvfb
           google-chrome-stable --version || sudo apt-get install -y google-chrome-stable
 
-      - name: Start API Server
+      - name: Start Server with Debug Logging
         run: |
-          # Clean up any stray processes
           pkill -f "bun start" || true
           pkill -f Xvfb || true
           
@@ -39,81 +38,99 @@ jobs:
           export PORT=3000
           export NODE_ENV=production
           
-          # Start Xvfb
           Xvfb :99 -screen 0 1024x768x24 &
           export DISPLAY=:99
           sleep 3
           
-          # Start server
-          bun start &
+          # Start server and capture ALL output including stderr
+          bun start 2>&1 | tee server.log &
+          SERVER_PID=$!
           
-          # Wait for port binding with increasing patience
           echo "Waiting for port 3000..."
-          for i in {1..30}; do
+          for i in {1..40}; do
             if ss -lnt | grep -q ":3000"; then
-              echo "✅ Port 3000 is listening!"
-              # Give Chrome an extra moment to spin up
-              sleep 15
+              echo "✅ Port ready"
+              # Extra time for Chrome to fully initialize
+              sleep 20
               break
             fi
-            echo "Attempt $i/30 - waiting..."
+            echo "Waiting... $i/40"
             sleep 3
           done
           
           if ! ss -lnt | grep -q ":3000"; then
-            echo "❌ Port 3000 never opened"
+            echo "❌ Port never bound"
+            cat server.log
             exit 1
           fi
 
-      - name: Solve Turnstile & Update Upstash
+      - name: Solve with Multiple Payload Variations
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         timeout-minutes: 15
         run: |
-          max_attempts=8
+          max_attempts=12
           delay=10
           token=""
+          
+          # Try all common payload variations
+          PAYLOADS=(
+            '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}'
+            '{"mode":"turnstile","url":"https://deltastudy.site/verify","sitekey":"0x4AAAAAADnpjMgvQPlaYYog"}'
+            '{"mode":"turnstile","domain":"https://deltastudy.site/verify","sitekey":"0x4AAAAAADnpjMgvQPlaYYog"}'
+            '{"mode":"turnstile","url":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}'
+          )
           
           for attempt in $(seq 1 $max_attempts); do
             echo "========================================="
             echo "ATTEMPT $attempt/$max_attempts"
             echo "========================================="
             
-            # Direct hit to /cloudflare with long timeout
-            RESP=$(curl -s -m 180 -X POST "http://127.0.0.1:3000/cloudflare" \
-              -H "Content-Type: application/json" \
-              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1)
+            # Rotate payloads
+            payload_index=$(( (attempt - 1) % ${#PAYLOADS[@]} ))
+            payload="${PAYLOADS[$payload_index]}"
+            echo "Payload: $payload"
             
-            # Parse if valid JSON
+            # Send request with verbose output to see what's happening
+            RESP=$(curl -s -m 180 -v -X POST "http://127.0.0.1:3000/cloudflare" \
+              -H "Content-Type: application/json" \
+              -d "$payload" 2>&1)
+            
+            curl_exit=$?
+            echo "Curl exit: $curl_exit"
+            
+            # Also check server logs for any errors
+            echo "Server log tail:"
+            tail -20 server.log || echo "No logs"
+            
             if echo "$RESP" | jq -e . >/dev/null 2>&1; then
               CODE=$(echo "$RESP" | jq -r '.code // ""')
               EXTRACTED=$(echo "$RESP" | jq -r '.token // ""')
-              MSG=$(echo "$RESP" | jq -r '.message // ""')
               
-              echo "Code: $CODE"
-              echo "Token: ${EXTRACTED:0:30}..."
+              echo "Response code: $CODE"
               
               if [ "$CODE" = "200" ] && [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "null" ]; then
                 token="$EXTRACTED"
                 echo "✅ Token captured!"
                 break
               else
-                echo "❌ Failed: $MSG"
+                echo "❌ Not valid yet"
               fi
             else
-              echo "❌ Invalid response: ${RESP:0:200}"
+              echo "❌ Invalid JSON or empty response"
+              echo "Raw: ${RESP:0:300}"
             fi
             
-            # Exponential backoff
             echo "Retrying in ${delay}s..."
             sleep $delay
             delay=$((delay * 2))
-            if [ $delay -gt 120 ]; then delay=120; fi
+            [ $delay -gt 120 ] && delay=120
           done
           
           if [ -z "$token" ]; then
-            echo "❌ Failed after $max_attempts attempts"
+            echo "❌ Failed all attempts"
+            cat server.log
             exit 1
           fi
           
@@ -128,16 +145,12 @@ jobs:
           COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -1 | sed 's/^[^:]*:\s*//' | cut -d';' -f1 | tr -d '\r\n')
           
           if [ -z "$COOKIE" ]; then
-            echo "❌ No cookie header found"
-            echo "$COOKIE_RESP" | head -20
+            echo "❌ No cookie"
+            echo "$COOKIE_RESP" | head -30
             exit 1
           fi
           
-          echo "✅ Cookie: ${COOKIE:0:50}..."
-          
-          echo "========================================="
-          echo "UPDATING UPSTASH"
-          echo "========================================="
+          echo "✅ Cookie: ${COOKIE:0:60}..."
           
           curl -s -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
