@@ -33,124 +33,7 @@ jobs:
           sudo ln -sf /usr/bin/google-chrome-stable /usr/bin/chromium-browser
 
       - name: Patch turnstile.ts
-        run: |
-          python3 << 'PYEOF'
-content = r"""const fs = require('fs');
-const path = require('path');
-
-interface TurnstileData {
-    domain: string;
-    siteKey: string;
-    proxy?: {
-        username?: string;
-        password?: string;
-    };
-}
-
-async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
-    if (!domain) throw new Error("Missing domain parameter");
-    if (!siteKey) throw new Error("Missing siteKey parameter");
-
-    const timeoutMs = (global as any).timeOut || 60000;
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error("Timeout reached after " + timeoutMs + "ms")), timeoutMs);
-    });
-
-    try {
-        if (proxy?.username && proxy?.password) {
-            await page.authenticate({
-                username: proxy.username,
-                password: proxy.password,
-            });
-        }
-
-        const htmlContent = `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body>
-<div class="cf-turnstile" data-sitekey="${siteKey}"></div>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-</body>
-</html>`;
-
-        page.removeAllListeners("request");
-        await page.setRequestInterception(true);
-
-        page.on("request", async (request: any) => {
-            const reqUrl = request.url();
-
-            if (reqUrl.includes("challenges.cloudflare.com/reports/")) {
-                return request.abort();
-            }
-
-            if (
-                reqUrl.includes("challenges.cloudflare.com/turnstile/v0/b/") &&
-                reqUrl.endsWith("/api.js")
-            ) {
-                const localPath = path.join(__dirname, '../js/api.js');
-                try {
-                    const body = fs.readFileSync(localPath);
-                    return request.respond({
-                        status: 200,
-                        contentType: 'application/javascript',
-                        body: body
-                    });
-                } catch {
-                    return request.continue();
-                }
-            }
-
-            if (
-                reqUrl.includes("challenges.cloudflare.com") ||
-                reqUrl.includes("/cdn-cgi/challenge-platform/")
-            ) {
-                return request.continue();
-            }
-
-            return request.continue();
-        });
-
-        try {
-            await page.goto(domain, { waitUntil: "domcontentloaded", timeout: 20000 });
-        } catch {
-            // ignore — we overwrite content next
-        }
-
-        await page.setContent(htmlContent, { waitUntil: "domcontentloaded" });
-
-        const tokenPromise = (async () => {
-            const start = Date.now();
-            while (Date.now() - start < timeoutMs) {
-                const token = await page.evaluate(() => {
-                    const el = document.querySelector(
-                        '[name="cf-turnstile-response"], [name="g-recaptcha-response"]'
-                    ) as HTMLInputElement | null;
-                    return el ? el.value : null;
-                }).catch(() => null);
-
-                if (token && token.length > 20) return token;
-                await new Promise(r => setTimeout(r, 500));
-            }
-            throw new Error("Token never appeared in DOM");
-        })();
-
-        return await Promise.race([tokenPromise, timeoutPromise]);
-
-    } catch (e) {
-        throw e;
-    }
-}
-
-export = turnstile;
-"""
-
-with open("src/lib/ends/turnstile.ts", "w") as f:
-    f.write(content)
-
-print("Patch OK")
-print(open("src/lib/ends/turnstile.ts").read()[:300])
-PYEOF
+        run: echo "CnBhdGNoZWQgPSAoCiAgICAiY29uc3QgZnMgPSByZXF1aXJlKCdmcycpOwoiCiAgICAiY29uc3QgcGF0aCA9IHJlcXVpcmUoJ3BhdGgnKTsKIgogICAgIgoiCiAgICAiaW50ZXJmYWNlIFR1cm5zdGlsZURhdGEgewoiCiAgICAiICAgIGRvbWFpbjogc3RyaW5nOwoiCiAgICAiICAgIHNpdGVLZXk6IHN0cmluZzsKIgogICAgIiAgICBwcm94eT86IHsKIgogICAgIiAgICAgICAgdXNlcm5hbWU/OiBzdHJpbmc7CiIKICAgICIgICAgICAgIHBhc3N3b3JkPzogc3RyaW5nOwoiCiAgICAiICAgIH07CiIKICAgICJ9CiIKICAgICIKIgogICAgImFzeW5jIGZ1bmN0aW9uIHR1cm5zdGlsZSh7IGRvbWFpbiwgcHJveHksIHNpdGVLZXkgfTogVHVybnN0aWxlRGF0YSwgcGFnZTogYW55KSB7CiIKICAgICIgICAgaWYgKCFkb21haW4pIHRocm93IG5ldyBFcnJvcignTWlzc2luZyBkb21haW4gcGFyYW1ldGVyJyk7CiIKICAgICIgICAgaWYgKCFzaXRlS2V5KSB0aHJvdyBuZXcgRXJyb3IoJ01pc3Npbmcgc2l0ZUtleSBwYXJhbWV0ZXInKTsKIgogICAgIgoiCiAgICAiICAgIGNvbnN0IHRpbWVvdXRNcyA9IChnbG9iYWwgYXMgYW55KS50aW1lT3V0IHx8IDYwMDAwOwoiCiAgICAiCiIKICAgICIgICAgY29uc3QgdGltZW91dFByb21pc2UgPSBuZXcgUHJvbWlzZTxuZXZlcj4oKF8sIHJlamVjdCkgPT4gewoiCiAgICAiICAgICAgICBzZXRUaW1lb3V0KCgpID0+IHJlamVjdChuZXcgRXJyb3IoJ1RpbWVvdXQgcmVhY2hlZCBhZnRlciAnICsgdGltZW91dE1zICsgJ21zJykpLCB0aW1lb3V0TXMpOwoiCiAgICAiICAgIH0pOwoiCiAgICAiCiIKICAgICIgICAgdHJ5IHsKIgogICAgIiAgICAgICAgaWYgKHByb3h5Py51c2VybmFtZSAmJiBwcm94eT8ucGFzc3dvcmQpIHsKIgogICAgIiAgICAgICAgICAgIGF3YWl0IHBhZ2UuYXV0aGVudGljYXRlKHsKIgogICAgIiAgICAgICAgICAgICAgICB1c2VybmFtZTogcHJveHkudXNlcm5hbWUsCiIKICAgICIgICAgICAgICAgICAgICAgcGFzc3dvcmQ6IHByb3h5LnBhc3N3b3JkLAoiCiAgICAiICAgICAgICAgICAgfSk7CiIKICAgICIgICAgICAgIH0KIgogICAgIgoiCiAgICAiICAgICAgICBjb25zdCBodG1sQ29udGVudCA9ICc8IURPQ1RZUEUgaHRtbD48aHRtbD48aGVhZD48bWV0YSBjaGFyc2V0PVwidXRmLThcIj48L2hlYWQ+JwoiCiAgICAiICAgICAgICAgICAgKyAnPGJvZHk+PGRpdiBjbGFzcz1cImNmLXR1cm5zdGlsZVwiIGRhdGEtc2l0ZWtleT1cIicgKyBzaXRlS2V5ICsgJ1wiPjwvZGl2PicKIgogICAgIiAgICAgICAgICAgICsgJzxzY3JpcHQgc3JjPVwiaHR0cHM6Ly9jaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9hcGkuanNcIiBhc3luYyBkZWZlcj48L3NjcmlwdD4nCiIKICAgICIgICAgICAgICAgICArICc8L2JvZHk+PC9odG1sPic7CiIKICAgICIKIgogICAgIiAgICAgICAgcGFnZS5yZW1vdmVBbGxMaXN0ZW5lcnMoJ3JlcXVlc3QnKTsKIgogICAgIiAgICAgICAgYXdhaXQgcGFnZS5zZXRSZXF1ZXN0SW50ZXJjZXB0aW9uKHRydWUpOwoiCiAgICAiCiIKICAgICIgICAgICAgIHBhZ2Uub24oJ3JlcXVlc3QnLCBhc3luYyAocmVxdWVzdDogYW55KSA9PiB7CiIKICAgICIgICAgICAgICAgICBjb25zdCByZXFVcmwgPSByZXF1ZXN0LnVybCgpOwoiCiAgICAiCiIKICAgICIgICAgICAgICAgICBpZiAocmVxVXJsLmluY2x1ZGVzKCdjaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3JlcG9ydHMvJykpIHsKIgogICAgIiAgICAgICAgICAgICAgICByZXR1cm4gcmVxdWVzdC5hYm9ydCgpOwoiCiAgICAiICAgICAgICAgICAgfQoiCiAgICAiCiIKICAgICIgICAgICAgICAgICBpZiAocmVxVXJsLmluY2x1ZGVzKCdjaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9iLycpICYmIHJlcVVybC5lbmRzV2l0aCgnL2FwaS5qcycpKSB7CiIKICAgICIgICAgICAgICAgICAgICAgY29uc3QgbG9jYWxQYXRoID0gcGF0aC5qb2luKF9fZGlybmFtZSwgJy4uL2pzL2FwaS5qcycpOwoiCiAgICAiICAgICAgICAgICAgICAgIHRyeSB7CiIKICAgICIgICAgICAgICAgICAgICAgICAgIGNvbnN0IGJvZHkgPSBmcy5yZWFkRmlsZVN5bmMobG9jYWxQYXRoKTsKIgogICAgIiAgICAgICAgICAgICAgICAgICAgcmV0dXJuIHJlcXVlc3QucmVzcG9uZCh7IHN0YXR1czogMjAwLCBjb250ZW50VHlwZTogJ2FwcGxpY2F0aW9uL2phdmFzY3JpcHQnLCBib2R5OiBib2R5IH0pOwoiCiAgICAiICAgICAgICAgICAgICAgIH0gY2F0Y2ggewoiCiAgICAiICAgICAgICAgICAgICAgICAgICByZXR1cm4gcmVxdWVzdC5jb250aW51ZSgpOwoiCiAgICAiICAgICAgICAgICAgICAgIH0KIgogICAgIiAgICAgICAgICAgIH0KIgogICAgIgoiCiAgICAiICAgICAgICAgICAgcmV0dXJuIHJlcXVlc3QuY29udGludWUoKTsKIgogICAgIiAgICAgICAgfSk7CiIKICAgICIKIgogICAgIiAgICAgICAgdHJ5IHsKIgogICAgIiAgICAgICAgICAgIGF3YWl0IHBhZ2UuZ290byhkb21haW4sIHsgd2FpdFVudGlsOiAnZG9tY29udGVudGxvYWRlZCcsIHRpbWVvdXQ6IDIwMDAwIH0pOwoiCiAgICAiICAgICAgICB9IGNhdGNoIHsKIgogICAgIiAgICAgICAgICAgIC8vIGlnbm9yZSBuYXZpZ2F0aW9uIGVycm9ycwoiCiAgICAiICAgICAgICB9CiIKICAgICIKIgogICAgIiAgICAgICAgYXdhaXQgcGFnZS5zZXRDb250ZW50KGh0bWxDb250ZW50LCB7IHdhaXRVbnRpbDogJ2RvbWNvbnRlbnRsb2FkZWQnIH0pOwoiCiAgICAiCiIKICAgICIgICAgICAgIGNvbnN0IHRva2VuUHJvbWlzZSA9IChhc3luYyAoKSA9PiB7CiIKICAgICIgICAgICAgICAgICBjb25zdCBzdGFydCA9IERhdGUubm93KCk7CiIKICAgICIgICAgICAgICAgICB3aGlsZSAoRGF0ZS5ub3coKSAtIHN0YXJ0IDwgdGltZW91dE1zKSB7CiIKICAgICIgICAgICAgICAgICAgICAgY29uc3QgdG9rZW4gPSBhd2FpdCBwYWdlLmV2YWx1YXRlKCgpID0+IHsKIgogICAgIiAgICAgICAgICAgICAgICAgICAgY29uc3QgZWwgPSBkb2N1bWVudC5xdWVyeVNlbGVjdG9yKAoiCiAgICAiICAgICAgICAgICAgICAgICAgICAgICAgJ1tuYW1lPVwiY2YtdHVybnN0aWxlLXJlc3BvbnNlXCJdLFtuYW1lPVwiZy1yZWNhcHRjaGEtcmVzcG9uc2VcIl0nCiIKICAgICIgICAgICAgICAgICAgICAgICAgICkgYXMgSFRNTElucHV0RWxlbWVudCB8IG51bGw7CiIKICAgICIgICAgICAgICAgICAgICAgICAgIHJldHVybiBlbCA/IGVsLnZhbHVlIDogbnVsbDsKIgogICAgIiAgICAgICAgICAgICAgICB9KS5jYXRjaCgoKSA9PiBudWxsKTsKIgogICAgIiAgICAgICAgICAgICAgICBpZiAodG9rZW4gJiYgdG9rZW4ubGVuZ3RoID4gMjApIHJldHVybiB0b2tlbjsKIgogICAgIiAgICAgICAgICAgICAgICBhd2FpdCBuZXcgUHJvbWlzZShyID0+IHNldFRpbWVvdXQociwgNTAwKSk7CiIKICAgICIgICAgICAgICAgICB9CiIKICAgICIgICAgICAgICAgICB0aHJvdyBuZXcgRXJyb3IoJ1Rva2VuIG5ldmVyIGFwcGVhcmVkIGluIERPTScpOwoiCiAgICAiICAgICAgICB9KSgpOwoiCiAgICAiCiIKICAgICIgICAgICAgIHJldHVybiBhd2FpdCBQcm9taXNlLnJhY2UoW3Rva2VuUHJvbWlzZSwgdGltZW91dFByb21pc2VdKTsKIgogICAgIgoiCiAgICAiICAgIH0gY2F0Y2ggKGUpIHsKIgogICAgIiAgICAgICAgdGhyb3cgZTsKIgogICAgIiAgICB9CiIKICAgICJ9CiIKICAgICIKIgogICAgImV4cG9ydCA9IHR1cm5zdGlsZTsKIgopCndpdGggb3Blbignc3JjL2xpYi9lbmRzL3R1cm5zdGlsZS50cycsICd3JykgYXMgZjoKICAgIGYud3JpdGUocGF0Y2hlZCkKcHJpbnQoJ1BhdGNoIE9LJykKcHJpbnQob3Blbignc3JjL2xpYi9lbmRzL3R1cm5zdGlsZS50cycpLnJlYWQoKVs6MzAwXSkK" | base64 -d > /tmp/patch.py && python3 /tmp/patch.py
 
       - name: Start Server & Wait for Readiness
         run: |
@@ -223,15 +106,12 @@ PYEOF
               echo "Server down, restarting..."
               pkill -f "bun start" 2>/dev/null || true
               sleep 2
-              DISPLAY=:99 CHROME_PATH=/usr/bin/google-chrome-stable PORT=3000 timeOut=60000 NODE_ENV=production \
-                bun start > /tmp/server.log 2>&1 &
+              DISPLAY=:99 CHROME_PATH=/usr/bin/google-chrome-stable PORT=3000 timeOut=60000 NODE_ENV=production bun start > /tmp/server.log 2>&1 &
               sleep 15
             fi
 
             echo "Calling /cloudflare (120s curl timeout)..."
-            RESP=$(curl -s -m 120 -X POST "http://127.0.0.1:3000/cloudflare" \
-              -H "Content-Type: application/json" \
-              -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1 || echo "CURL_FAILED")
+            RESP=$(curl -s -m 120 -X POST "http://127.0.0.1:3000/cloudflare"               -H "Content-Type: application/json"               -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1 || echo "CURL_FAILED")
 
             echo "Response: ${RESP:0:500}"
 
@@ -269,9 +149,7 @@ PYEOF
         if: env.TOKEN != ''
         run: |
           echo "Exchanging token for cookie..."
-          COOKIE_RESP=$(curl -s -i -X POST https://deltastudy.site/api/turnstile/verify \
-            -H "Content-Type: application/json" \
-            -d "{\"token\":\"$TOKEN\"}" 2>&1 || echo "COOKIE_REQUEST_FAILED")
+          COOKIE_RESP=$(curl -s -i -X POST https://deltastudy.site/api/turnstile/verify             -H "Content-Type: application/json"             -d "{\"token\":\"$TOKEN\"}" 2>&1 || echo "COOKIE_REQUEST_FAILED")
 
           if [ "$COOKIE_RESP" = "COOKIE_REQUEST_FAILED" ]; then
             echo "ERROR: Cookie exchange request failed"
@@ -295,10 +173,7 @@ PYEOF
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
           echo "Storing cookie in Upstash..."
-          UPSTASH_RESP=$(curl -s -w "\n%{http_code}" -X POST "${UPSTASH_REDIS_REST_URL}" \
-            -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
+          UPSTASH_RESP=$(curl -s -w "\n%{http_code}" -X POST "${UPSTASH_REDIS_REST_URL}"             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}"             -H "Content-Type: application/json"             -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
 
           HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
           BODY=$(echo "$UPSTASH_RESP" | sed '$d')
