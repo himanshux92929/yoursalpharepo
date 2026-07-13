@@ -1,82 +1,220 @@
-- name: Patch turnstile.ts
-  run: |
-    cat > src/lib/ends/turnstile.ts << 'TSEOF'
-    interface TurnstileData {
-        domain: string;
-        siteKey: string;
-        proxy?: {
-            username?: string;
-            password?: string;
-        };
-    }
+name: Run External API Task & Orchestrate Pipeline
 
-    async function turnstile({ domain, proxy, siteKey }: TurnstileData, page: any) {
-        if (!domain) throw new Error("Missing domain parameter");
-        if (!siteKey) throw new Error("Missing siteKey parameter");
+on:
+  repository_dispatch:
+    types: [run-solver-task]
+  workflow_dispatch:
 
-        const timeout = (global as any).timeOut || 60000;
+jobs:
+  run-and-report:
+    runs-on: ubuntu-latest
 
-        const htmlContent = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
-    <div class="cf-turnstile" data-sitekey="${siteKey}"></div>
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-    </body></html>`;
+    steps:
+      - name: Checkout External Public Repo
+        uses: actions/checkout@v4
+        with:
+          repository: 'abhinai2244/cf-bypass'
 
-        try {
-            if (proxy?.username && proxy?.password) {
-                await page.authenticate({
-                    username: proxy.username,
-                    password: proxy.password,
-                });
-            }
+      - name: Setup Bun Environment
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
-            await page.setCacheEnabled(false);
-            page.removeAllListeners("request");
-            await page.setRequestInterception(true);
+      - name: Install Dependencies
+        run: bun install
 
-            page.on("request", async (request: any) => {
-                const reqUrl = request.url();
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --fix-missing xvfb
+          echo "Chrome: $(which google-chrome-stable)"
+          google-chrome-stable --version
+          sudo ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome
+          sudo ln -sf /usr/bin/google-chrome-stable /usr/bin/chromium-browser
 
-                if ([domain, domain + "/"].includes(reqUrl) && request.resourceType() === "document") {
-                    return request.respond({
-                        status: 200,
-                        contentType: "text/html",
-                        body: htmlContent,
-                    });
-                }
+      - name: Patch turnstile.ts
+        run: |
+          echo "aW50ZXJmYWNlIFR1cm5zdGlsZURhdGEgewogICAgZG9tYWluOiBzdHJpbmc7CiAgICBzaXRlS2V5OiBzdHJpbmc7CiAgICBwcm94eT86IHsKICAgICAgICB1c2VybmFtZT86IHN0cmluZzsKICAgICAgICBwYXNzd29yZD86IHN0cmluZzsKICAgIH07Cn0KCmFzeW5jIGZ1bmN0aW9uIHR1cm5zdGlsZSh7IGRvbWFpbiwgcHJveHksIHNpdGVLZXkgfTogVHVybnN0aWxlRGF0YSwgcGFnZTogYW55KSB7CiAgICBpZiAoIWRvbWFpbikgdGhyb3cgbmV3IEVycm9yKCJNaXNzaW5nIGRvbWFpbiBwYXJhbWV0ZXIiKTsKICAgIGlmICghc2l0ZUtleSkgdGhyb3cgbmV3IEVycm9yKCJNaXNzaW5nIHNpdGVLZXkgcGFyYW1ldGVyIik7CgogICAgY29uc3QgdGltZW91dCA9IChnbG9iYWwgYXMgYW55KS50aW1lT3V0IHx8IDYwMDAwOwoKICAgIC8vIFRoZSBicm93c2VyIHdhcyBsYXVuY2hlZCB3aXRoIHR1cm5zdGlsZTp0cnVlIGluIGJyLnRzLgogICAgLy8gcGFnZUNvbnRyb2xsZXIoKSBhbHJlYWR5IHJ1bnMgdHVybnN0aWxlU29sdmVyKCkgb24gZXZlcnkgcGFnZSwgd2hpY2gKICAgIC8vIGNsaWNrcyB0aGUgd2lkZ2V0IGF1dG9tYXRpY2FsbHkuIGdldFBhZ2UoKSBpbiBpbmRleC50cyBhbHNvIHNldHMgYQogICAgLy8gcmVxdWVzdCBpbnRlcmNlcHRvciB0aGF0IGJsb2NrcyBpbWFnZXMvZm9udHMuCiAgICAvLwogICAgLy8gRG8gTk9UIHNldCBhbm90aGVyIGludGVyY2VwdG9yIGhlcmUuIFN0YWNraW5nIGludGVyY2VwdG9ycyBjYXVzZXMKICAgIC8vIHJlcXVlc3RzIHRvIGhhbmcuIERvIE5PVCBzZXJ2ZSBsb2NhbCBhcGkuanMuIEp1c3QgbmF2aWdhdGUgdG8gdGhlCiAgICAvLyByZWFsIGRvbWFpbiwgbGV0IHRoZSB3aWRnZXQgbG9hZCBhbmQgYXV0by1zb2x2ZSwgdGhlbiBwb2xsIGZvciB0aGUgdG9rZW4uCgogICAgY29uc3QgaHRtbENvbnRlbnQgPSBgPCFET0NUWVBFIGh0bWw+PGh0bWw+PGhlYWQ+PG1ldGEgY2hhcnNldD0idXRmLTgiPjwvaGVhZD48Ym9keT4KPGRpdiBjbGFzcz0iY2YtdHVybnN0aWxlIiBkYXRhLXNpdGVrZXk9IiR7c2l0ZUtleX0iPjwvZGl2Pgo8c2NyaXB0IHNyYz0iaHR0cHM6Ly9jaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9hcGkuanMiIGFzeW5jIGRlZmVyPjwvc2NyaXB0Pgo8L2JvZHk+PC9odG1sPmA7CgogICAgLy8gRGlzYWJsZSB0aGUgaW50ZXJjZXB0b3Igc2V0IGJ5IGdldFBhZ2UoKSBzbyB3ZSBjYW4gc2V0IG91ciBvd24gY2xlYW5seS4KICAgIC8vIFdlIG5lZWQgdG8gc2VydmUgdGhlIHR1cm5zdGlsZSBIVE1MIGZyb20gb3VyIGRvbWFpbiB0byBhdm9pZCBDRiBib3QgZGV0ZWN0aW9uLgogICAgcGFnZS5yZW1vdmVBbGxMaXN0ZW5lcnMoInJlcXVlc3QiKTsKICAgIGF3YWl0IHBhZ2Uuc2V0UmVxdWVzdEludGVyY2VwdGlvbih0cnVlKTsKCiAgICBwYWdlLm9uKCJyZXF1ZXN0IiwgYXN5bmMgKHJlcTogYW55KSA9PiB7CiAgICAgICAgY29uc3QgdXJsID0gcmVxLnVybCgpOwogICAgICAgIGNvbnN0IHR5cGUgPSByZXEucmVzb3VyY2VUeXBlKCk7CgogICAgICAgIC8vIFNlcnZlIG91ciB0dXJuc3RpbGUgSFRNTCBmb3IgdGhlIGRvbWFpbiAtIGtlZXBzIHJlYWwgb3JpZ2luIHNvIHNpdGVLZXkgdmFsaWRhdGVzCiAgICAgICAgaWYgKFtkb21haW4sIGRvbWFpbiArICIvIl0uaW5jbHVkZXModXJsKSAmJiB0eXBlID09PSAiZG9jdW1lbnQiKSB7CiAgICAgICAgICAgIHJldHVybiByZXEucmVzcG9uZCh7CiAgICAgICAgICAgICAgICBzdGF0dXM6IDIwMCwKICAgICAgICAgICAgICAgIGNvbnRlbnRUeXBlOiAidGV4dC9odG1sIiwKICAgICAgICAgICAgICAgIGJvZHk6IGh0bWxDb250ZW50LAogICAgICAgICAgICB9KTsKICAgICAgICB9CgogICAgICAgIC8vIEJsb2NrIHRlbGVtZXRyeSBvbmx5CiAgICAgICAgaWYgKHVybC5pbmNsdWRlcygiY2hhbGxlbmdlcy5jbG91ZGZsYXJlLmNvbS9yZXBvcnRzLyIpKSB7CiAgICAgICAgICAgIHJldHVybiByZXEuYWJvcnQoKTsKICAgICAgICB9CgogICAgICAgIC8vIEJsb2NrIGhlYXZ5IHJlc291cmNlcyB0byBzcGVlZCB0aGluZ3MgdXAKICAgICAgICBpZiAoWyJpbWFnZSIsICJzdHlsZXNoZWV0IiwgImZvbnQiLCAibWVkaWEiXS5pbmNsdWRlcyh0eXBlKSkgewogICAgICAgICAgICByZXR1cm4gcmVxLmFib3J0KCk7CiAgICAgICAgfQoKICAgICAgICAvLyBBbGxvdyBldmVyeXRoaW5nIGVsc2UgLSB0dXJuc3RpbGUgbmVlZHMgaXRzIHNjcmlwdHMgYW5kIFhIUiBjYWxscwogICAgICAgIHJldHVybiByZXEuY29udGludWUoKTsKICAgIH0pOwoKICAgIGF3YWl0IHBhZ2UuZ290byhkb21haW4sIHsgd2FpdFVudGlsOiAiZG9tY29udGVudGxvYWRlZCIsIHRpbWVvdXQ6IDE1MDAwIH0pOwoKICAgIC8vIFBvbGwgZm9yIHRoZSB0b2tlbiB2YWx1ZSBkaXJlY3RseSAtIHdhaXRGb3JTZWxlY3RvciBmaW5kcyB0aGUgaW5wdXQKICAgIC8vIGltbWVkaWF0ZWx5IGV2ZW4gd2hlbiBlbXB0eSwgc28gd2UgbXVzdCBwb2xsIHRoZSB2YWx1ZSBpbnN0ZWFkCiAgICBjb25zdCBzdGFydCA9IERhdGUubm93KCk7CiAgICB3aGlsZSAoRGF0ZS5ub3coKSAtIHN0YXJ0IDwgdGltZW91dCkgewogICAgICAgIGNvbnN0IHRva2VuOiBzdHJpbmcgfCBudWxsID0gYXdhaXQgcGFnZS5ldmFsdWF0ZSgoKSA9PiB7CiAgICAgICAgICAgIGNvbnN0IGVsID0gZG9jdW1lbnQucXVlcnlTZWxlY3RvcigKICAgICAgICAgICAgICAgICdbbmFtZT0iY2YtdHVybnN0aWxlLXJlc3BvbnNlIl0sW25hbWU9ImctcmVjYXB0Y2hhLXJlc3BvbnNlIl0nCiAgICAgICAgICAgICkgYXMgSFRNTElucHV0RWxlbWVudCB8IG51bGw7CiAgICAgICAgICAgIHJldHVybiBlbCAmJiBlbC52YWx1ZS5sZW5ndGggPiAxMCA/IGVsLnZhbHVlIDogbnVsbDsKICAgICAgICB9KS5jYXRjaCgoKSA9PiBudWxsKTsKCiAgICAgICAgaWYgKHRva2VuKSByZXR1cm4gdG9rZW47CiAgICAgICAgYXdhaXQgbmV3IFByb21pc2UociA9PiBzZXRUaW1lb3V0KHIsIDI1MCkpOwogICAgfQoKICAgIHRocm93IG5ldyBFcnJvcigiVGltZW91dDogdG9rZW4gbmV2ZXIgYXBwZWFyZWQiKTsKfQoKZXhwb3J0ID0gdHVybnN0aWxlOwo=" | base64 -d > src/lib/ends/turnstile.ts
+          echo "Patched. First 5 lines:"
+          head -5 src/lib/ends/turnstile.ts
+          echo "Line count:"
+          wc -l src/lib/ends/turnstile.ts
 
-                if (reqUrl.includes("challenges.cloudflare.com/reports/")) {
-                    return request.abort();
-                }
-
-                return request.continue();
-            });
-
-            await page.goto(domain, { waitUntil: "domcontentloaded", timeout: 15000 });
-
-            await page.waitForFunction(
-                () => {
-                    const el = document.querySelector('[name="cf-turnstile-response"]') as HTMLInputElement | null;
-                    return el !== null && el.value !== null && el.value.length > 10;
-                },
-                { timeout }
+      - name: Patch index.ts to remove conflicting interceptor from getPage
+        run: |
+          node -e "
+            const fs = require('fs');
+            let src = fs.readFileSync('src/index.ts', 'utf8');
+            const before = src;
+            src = src.replace(
+              /await page\.setRequestInterception\(true\);\s*page\.on\('request'[\s\S]*?\}\);\n/,
+              ''
             );
+            if (src === before) {
+              console.log('WARNING: pattern not matched, index.ts unchanged');
+            } else {
+              fs.writeFileSync('src/index.ts', src);
+              console.log('index.ts patched: conflicting interceptor removed');
+            }
+          "
+          grep -n "setRequestInterception" src/index.ts && echo "WARNING: still present" || echo "Confirmed: interceptor block gone"
 
-            const token = await page.evaluate(() => {
-                const el = document.querySelector('[name="cf-turnstile-response"]') as HTMLInputElement | null;
-                return el ? el.value : null;
-            });
+      - name: Start Server & Wait for Readiness
+        run: |
+          pkill -f "bun start" 2>/dev/null || true
+          pkill -f Xvfb 2>/dev/null || true
+          sleep 2
 
-            if (!token || token.length < 10) throw new Error("Failed to get token");
-            return token;
+          Xvfb :99 -screen 0 1024x768x24 &
+          export DISPLAY=:99
+          export CHROME_PATH=/usr/bin/google-chrome-stable
+          export PORT=3000
+          export NODE_ENV=production
+          export timeOut=60000
 
-        } catch (e) {
-            throw e;
-        }
-    }
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "CHROME_PATH=/usr/bin/google-chrome-stable" >> $GITHUB_ENV
+          echo "PORT=3000" >> $GITHUB_ENV
+          echo "timeOut=60000" >> $GITHUB_ENV
 
-    export = turnstile;
-    TSEOF
-    echo "Patched. First 5 lines:"
-    head -5 src/lib/ends/turnstile.ts
-    echo "Line count:"
-    wc -l src/lib/ends/turnstile.ts
+          bun start > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+
+          echo "Waiting for port 3000..."
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+              echo "Port 3000 alive after $((i * 2))s"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server died during startup! Log:"
+              cat /tmp/server.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Waiting for browser initialization..."
+          for i in $(seq 1 40); do
+            if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
+              echo "Browser initialized after $((i * 2))s"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server died during browser init! Log:"
+              cat /tmp/server.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Server ready."
+
+      - name: Solve Turnstile
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          DISPLAY: :99
+          CHROME_PATH: /usr/bin/google-chrome-stable
+          PORT: 3000
+          timeOut: 60000
+          NODE_ENV: production
+        run: |
+          TOKEN=""
+          for i in 1 2 3 4 5; do
+            echo ""
+            echo "=== Turnstile Attempt $i of 5 ==="
+
+            if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+              echo "Server down, restarting..."
+              pkill -f "bun start" 2>/dev/null || true
+              sleep 2
+              DISPLAY=:99 CHROME_PATH=/usr/bin/google-chrome-stable PORT=3000 timeOut=60000 NODE_ENV=production bun start > /tmp/server.log 2>&1 &
+              sleep 15
+            fi
+
+            echo "Calling /cloudflare (120s curl timeout)..."
+            RESP=$(curl -s -m 120 -X POST "http://127.0.0.1:3000/cloudflare" \
+              -H "Content-Type: application/json" \
+              -d '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1 || echo "CURL_FAILED")
+
+            echo "Response: ${RESP:0:500}"
+
+            if [ "$RESP" = "CURL_FAILED" ]; then
+              echo "Curl failed."
+              tail -20 /tmp/server.log
+              continue
+            fi
+
+            TOKEN=$(echo "$RESP" | jq -r '.token // empty' 2>/dev/null || echo "")
+
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+              echo ""
+              echo "TOKEN OBTAINED: ${TOKEN:0:60}..."
+              echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+              break
+            fi
+
+            echo "No token yet. Server log tail:"
+            tail -10 /tmp/server.log
+            sleep 5
+          done
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo ""
+            echo "ERROR: All 5 attempts failed."
+            echo "Full server log:"
+            cat /tmp/server.log
+            exit 1
+          fi
+
+          echo "Token captured."
+
+      - name: Extract Cookie
+        if: env.TOKEN != ''
+        run: |
+          echo "Exchanging token for cookie..."
+          COOKIE_RESP=$(curl -s -i -X POST https://deltastudy.site/api/turnstile/verify \
+            -H "Content-Type: application/json" \
+            -d "{\"token\":\"$TOKEN\"}" 2>&1 || echo "COOKIE_REQUEST_FAILED")
+
+          if [ "$COOKIE_RESP" = "COOKIE_REQUEST_FAILED" ]; then
+            echo "ERROR: Cookie exchange request failed"
+            exit 1
+          fi
+
+          COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -1 | cut -d';' -f1 | sed 's/^[^:]*:\s*//')
+
+          if [ -z "$COOKIE" ]; then
+            echo "ERROR: No Set-Cookie header found"
+            exit 1
+          fi
+
+          echo "Cookie: ${COOKIE:0:80}..."
+          echo "COOKIE=$COOKIE" >> $GITHUB_ENV
+
+      - name: Update Upstash
+        if: env.COOKIE != ''
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          echo "Storing cookie in Upstash..."
+          UPSTASH_RESP=$(curl -s -w "\n%{http_code}" -X POST "${UPSTASH_REDIS_REST_URL}" \
+            -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
+
+          HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
+          BODY=$(echo "$UPSTASH_RESP" | sed '$d')
+
+          echo "Upstash status: $HTTP_CODE"
+          echo "Upstash response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Upstash update failed"
+            exit 1
+          fi
+
+          echo "Cookie stored."
